@@ -261,6 +261,22 @@ docker compose up -d        # runs 24/7, restarts on failure
 | `MAX_NOTIFICATIONS_PER_CYCLE` | `10` | anti-spam cap per filter per cycle |
 | `SS_LANG` | `ru` | ss.lv locale used for scraping (`ru` / `lv`) |
 
+## ☁️ Deployment
+
+The bot is a long-running process (Telegram long-polling), so it needs an **always-on host** — not a serverless/CI runner. The repo ships a `Dockerfile` (with a persistent volume for the SQLite DB) and a `railway.toml`, so going live is a few clicks.
+
+**Railway** (one-click from this repo):
+
+1. *New Project → Deploy from GitHub repo → `sslv-bot`* — Railway auto-detects the `Dockerfile` + `railway.toml`.
+2. Add the `BOT_TOKEN` variable.
+3. Mount a volume at `/app/data` so saved filters survive redeploys.
+
+It runs anywhere Docker does — Fly.io, a VPS, even a Raspberry Pi:
+
+```bash
+docker compose up -d        # runs 24/7, auto-restarts on failure
+```
+
 ## ✅ Tests & CI
 
 ```bash
