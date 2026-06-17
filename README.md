@@ -8,7 +8,7 @@
 [![aiogram](https://img.shields.io/badge/aiogram-3.13-2CA5E0?logo=telegram&logoColor=white)](https://docs.aiogram.dev)
 [![SQLite](https://img.shields.io/badge/SQLite-aiosqlite-003B57?logo=sqlite&logoColor=white)](https://www.sqlite.org)
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](https://www.docker.com)
-[![Tests](https://img.shields.io/badge/tests-33%20passed-success)](#-tests--ci)
+[![CI](https://github.com/AAvlasins-dev/sslv-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/AAvlasins-dev/sslv-bot/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Viewing%20only-red)](#-license)
 
 🇬🇧 [English](#-english) · 🇷🇺 [Русский](#-русский) · 🇱🇻 [Latviešu](#-latviešu)
