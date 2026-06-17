@@ -1,0 +1,9 @@
+services:
+  bot:
+    build: .
+    image: sslv-bot
+    container_name: sslv-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data

@@ -1,0 +1,33 @@
+.env
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+data/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+*.log
+
+# tooling / local
+.pytest_cache/
+.claude/
+
+# dev scripts & generated artefacts (not part of the app)
+# (single-underscore temp files like _catalog.py / _out.txt — NOT __init__.py)
+_[a-z]*.py
+_[a-z]*.txt
+КАТАЛОГ_*.md
+*.output
