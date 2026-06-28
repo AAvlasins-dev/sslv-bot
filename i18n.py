@@ -1,22 +1,50 @@
 """
-Переводы интерфейса бота на три языка.
+Переводы интерфейса бота. Интерфейс — два языка: русский и латышский.
+(Английский остаётся только в README на GitHub, в боте его нет.)
 Использование: T[lang]["ключ"] или t(lang, "ключ", **kwargs)
 """
+import re
 from typing import Optional
 
+# Языки интерфейса бота (выбор в /lang). Английский намеренно не предлагаем —
+# латышские названия ss.lv отдаёт нативно, а англоязычные подписи фильтров
+# пришлось бы вести вручную. Любой иной код приводится к ru.
 LANGS = {
     "ru": "🇷🇺 Русский",
     "lv": "🇱🇻 Latviešu",
-    "en": "🇬🇧 English",
 }
 
-# ss.lv URL prefix per language
-SS_PREFIX = {
-    "ru": "/ru",
-    "lv": "/lv",
-    "en": "/en",  # ss.lv не имеет /en/, фолбэк на /ru/
+# Команды бота (меню «/») по языкам — только ru/lv. По умолчанию русское,
+# при выборе языка в боте меню переключается на выбранный (per-chat).
+BOT_COMMANDS: dict[str, list[tuple[str, str]]] = {
+    "ru": [
+        ("start",    "🚀 Запустить бота"),
+        ("add",      "➕ Добавить фильтр"),
+        ("list",     "📋 Мои фильтры"),
+        ("stats",    "📊 Статистика"),
+        ("location", "📍 Моё местоположение"),
+        ("lang",     "🌐 Выбрать язык"),
+        ("diag",     "🩺 Диагностика"),
+        ("cancel",   "❌ Отмена"),
+    ],
+    "lv": [
+        ("start",    "🚀 Palaist botu"),
+        ("add",      "➕ Pievienot filtru"),
+        ("list",     "📋 Mani filtri"),
+        ("stats",    "📊 Statistika"),
+        ("location", "📍 Mana atrašanās vieta"),
+        ("lang",     "🌐 Valoda"),
+        ("diag",     "🩺 Diagnostika"),
+        ("cancel",   "❌ Atcelt"),
+    ],
 }
-SS_LANG_URL = {"ru": "ru", "lv": "lv", "en": "ru"}  # en → uses /ru/ on ss.lv
+
+# ss.lv URL prefix per language. ss.lv отдаёт ВСЕ три языка нативно
+# (/ru/, /lv/, /en/) с переведёнными названиями категорий/марок/моделей —
+# имена тянем с нужного префикса (см. parser._loc), а внутренние URL для
+# мониторинга держим каноничными на /ru/.
+SS_PREFIX = {"ru": "/ru", "lv": "/lv", "en": "/en"}
+SS_LANG_URL = {"ru": "ru", "lv": "lv", "en": "en"}
 
 
 T: dict[str, dict[str, str]] = {
@@ -76,6 +104,11 @@ T: dict[str, dict[str, str]] = {
         "lv": "Izvēlies apakškategoriju",
         "en": "Choose a subcategory",
     },
+    "monitor_all": {
+        "ru": "✅ Весь раздел",
+        "lv": "✅ Visa sadaļa",
+        "en": "✅ Whole section",
+    },
     "choose_brand": {
         "ru": "Выбери марку",
         "lv": "Izvēlies marku",
@@ -120,6 +153,33 @@ T: dict[str, dict[str, str]] = {
         "ru": "🔘 Любая марка",
         "lv": "🔘 Jebkura marka",
         "en": "🔘 Any brand",
+    },
+    "region_btn":  {"ru": "📍 Регион", "lv": "📍 Reģions", "en": "📍 Region"},
+    "radius_btn":  {"ru": "📍 Радиус", "lv": "📍 Rādiuss", "en": "📍 Radius"},
+    "any_region":  {"ru": "🔘 Любой",  "lv": "🔘 Jebkurš", "en": "🔘 Any"},
+    "region_title": {
+        "ru": "📍 Выбери регион (фильтр по городу из объявления):",
+        "lv": "📍 Izvēlies reģionu (filtrs pēc pilsētas sludinājumā):",
+        "en": "📍 Pick a region (filters by the ad's city):",
+    },
+    "region_none": {
+        "ru": "⚠️ Для этого раздела регионы недоступны. Попробуй радиус от себя.",
+        "lv": "⚠️ Šai sadaļai reģioni nav pieejami. Mēģini rādiusu no sevis.",
+        "en": "⚠️ No regions for this section. Try a radius from you.",
+    },
+    "radius_hint": {
+        "ru": "📍 <b>Радиус от твоего местоположения</b>\nПришлю только объявления в пределах N км.\n(Нужно задать /location.)",
+        "lv": "📍 <b>Rādiuss no tavas atrašanās vietas</b>\nSūtīšu tikai sludinājumus N km rādiusā.\n(Nepieciešams /location.)",
+        "en": "📍 <b>Radius from your location</b>\nI'll send only listings within N km.\n(Set /location first.)",
+    },
+    "region_lbl":  {"ru": "📍 Регион", "lv": "📍 Reģions", "en": "📍 Region"},
+    "radius_lbl":  {"ru": "📍 Радиус", "lv": "📍 Rādiuss", "en": "📍 Radius"},
+    "district_lbl": {"ru": "📍 Район", "lv": "📍 Rajons", "en": "📍 District"},
+    "any_district": {"ru": "🔘 Весь регион", "lv": "🔘 Viss reģions", "en": "🔘 Whole region"},
+    "district_title": {
+        "ru": "📍 Выбери район ({region}):",
+        "lv": "📍 Izvēlies rajonu ({region}):",
+        "en": "📍 Pick a district ({region}):",
     },
     "all_riga": {
         "ru": "🌆 Вся Рига",
@@ -201,9 +261,94 @@ T: dict[str, dict[str, str]] = {
         "en": "⏳ Saving…",
     },
     "saved": {
-        "ru": "✅ Фильтр <b>#{fid}</b> сохранён!\nОбъявлений сейчас: <b>{n}</b>\n<a href='{url}'>Открыть на ss.lv →</a>",
-        "lv": "✅ Filtrs <b>#{fid}</b> saglabāts!\nSludinājumu tagad: <b>{n}</b>\n<a href='{url}'>Atvērt ss.lv →</a>",
-        "en": "✅ Filter <b>#{fid}</b> saved!\nCurrent listings: <b>{n}</b>\n<a href='{url}'>Open on ss.lv →</a>",
+        "ru": "✅ Фильтр <b>#{fid}</b> сохранён!\n📅 {date} · {period}: <b>{n}</b>\nДальше пришлю только новые.\n<a href='{url}'>Открыть на ss.lv →</a>",
+        "lv": "✅ Filtrs <b>#{fid}</b> saglabāts!\n📅 {date} · {period}: <b>{n}</b>\nTurpmāk paziņošu tikai par jaunajiem.\n<a href='{url}'>Atvērt ss.lv →</a>",
+        "en": "✅ Filter <b>#{fid}</b> saved!\n📅 {date} · {period}: <b>{n}</b>\nFrom now I'll alert only new ones.\n<a href='{url}'>Open on ss.lv →</a>",
+    },
+    "period_today": {"ru": "За сегодня", "lv": "Šodien",          "en": "Today"},
+    "period_2":     {"ru": "За 2 дня",   "lv": "Pēdējās 2 dienās", "en": "Last 2 days"},
+    "period_5":     {"ru": "За 5 дней",  "lv": "Pēdējās 5 dienās", "en": "Last 5 days"},
+    "save_hub_warning": {
+        "ru": "⚠️ В этом разделе нет объявлений напрямую — это меню подразделов.\nЗайди глубже и выбери подраздел со списком объявлений (или «🔎 Слово» в нём).",
+        "lv": "⚠️ Šajā sadaļā nav sludinājumu tieši — tā ir apakšsadaļu izvēlne.\nIeej dziļāk un izvēlies apakšsadaļu ar sludinājumu sarakstu (vai «🔎 Vārds» tajā).",
+        "en": "⚠️ This section has no listings directly — it's a subcategory menu.\nGo deeper and pick a subsection with an actual listing (or «🔎 Keyword» in it).",
+    },
+    "show_today_q": {
+        "ru": "Показать эти объявления?",
+        "lv": "Rādīt šos sludinājumus?",
+        "en": "Show these listings?",
+    },
+    "yes": {"ru": "✅ Да", "lv": "✅ Jā", "en": "✅ Yes"},
+    "no":  {"ru": "❌ Нет", "lv": "❌ Nē", "en": "❌ No"},
+    "today_empty": {
+        "ru": "За сегодня подходящих объявлений нет.",
+        "lv": "Šodien atbilstošu sludinājumu nav.",
+        "en": "No matching listings posted today.",
+    },
+    "diag_running": {
+        "ru": "🩺 Проверяю работоспособность…",
+        "lv": "🩺 Pārbaudu darbspēju…",
+        "en": "🩺 Running self-test…",
+    },
+    "diag_title": {
+        "ru": "🩺 <b>Самодиагностика</b>",
+        "lv": "🩺 <b>Pašdiagnostika</b>",
+        "en": "🩺 <b>Self-test</b>",
+    },
+    "diag_line": {
+        "ru": "{ok} {icon} {ads} объявл. · сегодня {today}{chk}",
+        "lv": "{ok} {icon} {ads} sludin. · šodien {today}{chk}",
+        "en": "{ok} {icon} {ads} ads · today {today}{chk}",
+    },
+    "diag_send_ok": {
+        "ru": "📨 Отправка сообщений: ✅",
+        "lv": "📨 Ziņu sūtīšana: ✅",
+        "en": "📨 Message delivery: ✅",
+    },
+    "diag_send_fail": {
+        "ru": "📨 Отправка сообщений: ⚠️",
+        "lv": "📨 Ziņu sūtīšana: ⚠️",
+        "en": "📨 Message delivery: ⚠️",
+    },
+    "diag_filters": {
+        "ru": "📋 Твои фильтры: <b>{n}</b> активных",
+        "lv": "📋 Tavi filtri: <b>{n}</b> aktīvi",
+        "en": "📋 Your filters: <b>{n}</b> active",
+    },
+    "diag_stuck": {
+        "ru": "⚠️ Без объявлений (возможно, раздел-хаб): {ids}",
+        "lv": "⚠️ Bez sludinājumiem (iespējams, sadaļa-izvēlne): {ids}",
+        "en": "⚠️ No listings (possibly a hub section): {ids}",
+    },
+    "diag_fix_btn": {
+        "ru": "🔧 Авто-починка",
+        "lv": "🔧 Pašlabošana",
+        "en": "🔧 Auto-heal",
+    },
+    "diag_fixed": {
+        "ru": "🔧 Готово: кэш сброшен ({n} записей), фильтры перепроверятся в ближайшем цикле.",
+        "lv": "🔧 Gatavs: kešs notīrīts ({n} ieraksti), filtri tiks pārbaudīti tuvākajā ciklā.",
+        "en": "🔧 Done: cache cleared ({n} entries), filters will re-check on the next cycle.",
+    },
+    "today_retry": {
+        "ru": "⚠️ ss.lv сейчас не ответил. Нажми «Открыть на ss.lv» или попробуй ещё раз позже.",
+        "lv": "⚠️ ss.lv pašlaik neatbildēja. Spied «Atvērt ss.lv» vai mēģini vēlāk vēlreiz.",
+        "en": "⚠️ ss.lv didn't respond. Tap «Open on ss.lv» or try again later.",
+    },
+    "today_done": {
+        "ru": "👆 Это объявления за сегодня. Дальше — только новые.",
+        "lv": "👆 Šodienas sludinājumi. Turpmāk — tikai jaunie.",
+        "en": "👆 Today's listings. From now on — only new ones.",
+    },
+    "more_listings": {
+        "ru": "…и ещё {n} подходящих за сегодня (показал первые 15).",
+        "lv": "…un vēl {n} atbilstoši šodien (parādīju pirmos 15).",
+        "en": "…and {n} more matching today (showed the first 15).",
+    },
+    "geo_note": {
+        "ru": "📍 Это по всему разделу. По «Моё место» отфильтрую при показе и в уведомлениях.",
+        "lv": "📍 Tas ir par visu sadaļu. Pēc «Mana vieta» atfiltrēšu rādot un paziņojumos.",
+        "en": "📍 This is the whole section. I'll filter by «My place» on show and in alerts.",
     },
     "no_filters": {
         "ru": "Фильтров нет.\n/add — добавить первый.",
@@ -236,9 +381,34 @@ T: dict[str, dict[str, str]] = {
         "en": "❌ «{name}» not found. Try another name.",
     },
     "city_page_title": {
-        "ru": "📍 Выбери свой город",
-        "lv": "📍 Izvēlies savu pilsētu",
-        "en": "📍 Choose your city",
+        "ru": "📍 Выбери свой город / регион",
+        "lv": "📍 Izvēlies pilsētu / reģionu",
+        "en": "📍 Choose your city / region",
+    },
+    "place_title": {
+        "ru": "📍 <b>Моё место</b>\nКак задать?",
+        "lv": "📍 <b>Mana atrašanās vieta</b>\nKā norādīt?",
+        "en": "📍 <b>My location</b>\nHow to set it?",
+    },
+    "place_gps": {
+        "ru": "📍 Моя геолокация",
+        "lv": "📍 Mana ģeolokācija",
+        "en": "📍 My GPS location",
+    },
+    "place_cities": {
+        "ru": "🏙 Список городов",
+        "lv": "🏙 Pilsētu saraksts",
+        "en": "🏙 City list",
+    },
+    "place_gps_ask": {
+        "ru": "📍 Нажми кнопку ниже, чтобы поделиться геолокацией:",
+        "lv": "📍 Nospied pogu zemāk, lai dalītos ar ģeolokāciju:",
+        "en": "📍 Tap the button below to share your location:",
+    },
+    "place_radius_ask": {
+        "ru": "📍 <b>{name}</b>\nВ каком радиусе присылать объявления?",
+        "lv": "📍 <b>{name}</b>\nKādā rādiusā sūtīt sludinājumus?",
+        "en": "📍 <b>{name}</b>\nWithin what radius to send listings?",
     },
     "city_gps_btn": {
         "ru": "📍 Отправить GPS",
@@ -288,9 +458,37 @@ T: dict[str, dict[str, str]] = {
 }
 
 
+# Перевод названий фильтров ss.lv (которые скрейпятся по-русски) для показа.
+# Матчинг остаётся по русской метке — это только отображение.
+FILTER_LABELS: dict[str, dict[str, str]] = {
+    "Консоль":          {"en": "Console",    "lv": "Konsole"},
+    "Сост.":            {"en": "Cond.",      "lv": "Stāv."},
+    "Состояние":        {"en": "Condition",  "lv": "Stāvoklis"},
+    "Коробка передач":  {"en": "Gearbox",    "lv": "Ātrumkārba"},
+    "Тип кузова":       {"en": "Body type",  "lv": "Virsbūve"},
+    "Цвет":             {"en": "Colour",     "lv": "Krāsa"},
+    "Двигатель":        {"en": "Fuel",       "lv": "Degviela"},
+    "Привод":           {"en": "Drive",      "lv": "Piedziņa"},
+    "Дни работы":       {"en": "Work days",  "lv": "Darba dienas"},
+    "Местонахождение":  {"en": "Location",   "lv": "Atrašanās vieta"},
+    "Серия":            {"en": "Series",     "lv": "Sērija"},
+    "Тип двери":        {"en": "Door type",  "lv": "Durvju tips"},
+    "Материал":         {"en": "Material",   "lv": "Materiāls"},
+    "Размер":           {"en": "Size",       "lv": "Izmērs"},
+    "Производитель":    {"en": "Maker",      "lv": "Ražotājs"},
+}
+
+
+def filter_label(label: str, lang: str) -> str:
+    """Перевод метки фильтра для показа; для ru — как есть, иначе — из таблицы."""
+    if lang == "ru":
+        return label
+    return FILTER_LABELS.get(label, {}).get(lang, label)
+
+
 def t(lang: str, key: str, **kwargs) -> str:
     """Get translated string for the given lang and key."""
-    lang = lang if lang in ("ru", "lv", "en") else "ru"
+    lang = lang if lang in ("ru", "lv") else "ru"
     msg = T.get(key, {}).get(lang) or T.get(key, {}).get("ru") or key
     if kwargs:
         try:
@@ -387,3 +585,113 @@ def translate_subcat(name: str, lang: str) -> str:
 
 def cat_label(cat_id: str, lang: str) -> str:
     return CAT_LABELS.get(cat_id, {}).get(lang) or cat_id
+
+
+# ── Статический перевод подписей фильтров (filters_config.py / brands.py) ─────
+# Эти подписи захардкожены по-русски и показываются в меню легковых/простого
+# флоу (метки полей, заголовки подменю, подписи опций). Значения для матчинга
+# (2-й элемент кортежей в filters_config) НЕ трогаем — они в меню не видны.
+# Ключ = русское «ядро» подписи без ведущего эмодзи, в нижнем регистре.
+# Латышские термины — как у самого ss.lv (Benzīns/Dīzelis/Sedans/Melna…).
+UI_I18N: dict[str, dict[str, str]] = {
+    # поля / заголовки
+    "цена €":            {"lv": "Cena €"},
+    "год выпуска":       {"lv": "Izlaiduma gads"},
+    "пробег км":         {"lv": "Nobraukums km"},
+    "объём двигателя":   {"lv": "Dzinēja tilpums"},
+    "тип топлива":       {"lv": "Degvielas tips"},
+    "коробка передач":   {"lv": "Ātrumkārba"},
+    "тип кузова":        {"lv": "Virsbūves tips"},
+    "привод":            {"lv": "Piedziņa"},
+    "цвет":              {"lv": "Krāsa"},
+    "ключевое слово":    {"lv": "Atslēgvārds"},
+    "площадь м²":        {"lv": "Platība m²"},
+    "комнат":            {"lv": "Istabas"},
+    "этаж":              {"lv": "Stāvs"},
+    "зарплата €":        {"lv": "Alga €"},
+    "опыт работы":       {"lv": "Darba pieredze"},
+    "опыт":              {"lv": "Pieredze"},
+    "должность/слово":   {"lv": "Amats/vārds"},
+    "состояние":         {"lv": "Stāvoklis"},
+    "размер":            {"lv": "Izmērs"},
+    "порода / слово":    {"lv": "Šķirne / vārds"},
+    # топливо
+    "бензин":            {"lv": "Benzīns"},
+    "дизель":            {"lv": "Dīzelis"},
+    "электро":           {"lv": "Elektriskais"},
+    "гибрид":            {"lv": "Hibrīds"},
+    "газ (lpg)":         {"lv": "Gāze (LPG)"},
+    "газ/бензин":        {"lv": "Benzīns/gāze"},
+    # коробка
+    "автомат":           {"lv": "Automāts"},
+    "механика":          {"lv": "Manuālā"},
+    "полуавтомат":       {"lv": "Pusautomāts"},
+    # кузов
+    "седан":             {"lv": "Sedans"},
+    "внедорожник / джип":{"lv": "Apvidus / džips"},
+    "универсал":         {"lv": "Universāls"},
+    "хэтчбек":           {"lv": "Hečbeks"},
+    "минивэн":           {"lv": "Minivens"},
+    "купе":              {"lv": "Kupeja"},
+    "кабриолет":         {"lv": "Kabriolets"},
+    "пикап":             {"lv": "Pikaps"},
+    "микроавтобус":      {"lv": "Mikroautobuss"},
+    # привод
+    "передний":          {"lv": "Priekšējā"},
+    "задний":            {"lv": "Aizmugurējā"},
+    "полный":            {"lv": "Pilnpiedziņa"},
+    # цвет
+    "чёрный":            {"lv": "Melna"},
+    "белый":             {"lv": "Balta"},
+    "красный":           {"lv": "Sarkana"},
+    "синий":             {"lv": "Zila"},
+    "коричневый":        {"lv": "Brūna"},
+    "жёлтый":            {"lv": "Dzeltena"},
+    "зелёный":           {"lv": "Zaļa"},
+    "серый":             {"lv": "Pelēka"},
+    "серебристый":       {"lv": "Sudraba"},
+    "оранжевый":         {"lv": "Oranža"},
+    # комнаты
+    "1 комната":         {"lv": "1 istaba"},
+    "2 комнаты":         {"lv": "2 istabas"},
+    "3 комнаты":         {"lv": "3 istabas"},
+    "4 комнаты":         {"lv": "4 istabas"},
+    "5+ комнат":         {"lv": "5+ istabas"},
+    # этаж
+    "не первый":         {"lv": "Ne pirmais"},
+    "не последний":      {"lv": "Ne pēdējais"},
+    "1 этаж":            {"lv": "1. stāvs"},
+    "2 этаж":            {"lv": "2. stāvs"},
+    "3 этаж":            {"lv": "3. stāvs"},
+    "4-5 этаж":          {"lv": "4.-5. stāvs"},
+    "6-9 этаж":          {"lv": "6.-9. stāvs"},
+    "10+ этаж":          {"lv": "10.+ stāvs"},
+    # состояние
+    "новое":             {"lv": "Jauns"},
+    "хорошее":           {"lv": "Labs"},
+    "требует ремонта":   {"lv": "Nepieciešams remonts"},
+    # опыт
+    "без опыта":         {"lv": "Bez pieredzes"},
+    "1–2 года":          {"lv": "1–2 gadi"},
+    "3–5 лет":           {"lv": "3–5 gadi"},
+    "5+ лет":            {"lv": "5+ gadi"},
+}
+
+_UI_EMOJI = re.compile(r"^[^\w]+", re.UNICODE)
+
+
+def ui(text: str, lang: str) -> str:
+    """Локализованный ПОКАЗ статичной русской подписи фильтра (для меню).
+
+    ru → как есть. Для lv ищем перевод «ядра» подписи (без ведущего эмодзи)
+    в UI_I18N; эмодзи сохраняем. Нет перевода → возвращаем оригинал.
+    """
+    if lang == "ru" or not text:
+        return text
+    m = _UI_EMOJI.match(text)
+    prefix = m.group(0) if m else ""
+    core = text[len(prefix):]
+    tr = UI_I18N.get(core.strip().lower())
+    if not tr:
+        return text
+    return prefix + tr.get(lang, core)

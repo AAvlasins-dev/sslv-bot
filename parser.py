@@ -16,6 +16,7 @@ import asyncio
 import datetime
 import logging
 import re
+import time
 from typing import Optional
 from urllib.parse import urlencode, urljoin
 
@@ -65,13 +66,31 @@ _lock = asyncio.Lock()
 # ---------------------------------------------------------------------------
 # HTTP helper
 # ---------------------------------------------------------------------------
-async def _fetch(url: str) -> str:
-    async with aiohttp.ClientSession(
-        headers=HEADERS, timeout=aiohttp.ClientTimeout(total=30)
-    ) as s:
-        async with s.get(url) as r:
-            r.raise_for_status()
-            return await r.text()
+async def _fetch(url: str, retries: int = 1) -> str:
+    """GET страницы ss.lv с повтором при сбое.
+
+    ss.lv нестабилен (особенно для датацентровых IP): иногда обрывает
+    соединение. Делаем 1 повтор. ВАЖНО: короткий таймаут (12с) и мало попыток —
+    иначе при медленном ss.lv интерактив (добавление фильтра делает много
+    запросов) «зависает». Worst-case на запрос ~24с вместо 90с.
+    """
+    last = None
+    for attempt in range(retries + 1):
+        try:
+            async with aiohttp.ClientSession(
+                headers=HEADERS, timeout=aiohttp.ClientTimeout(total=12)
+            ) as s:
+                async with s.get(url) as r:
+                    r.raise_for_status()
+                    return await r.text()
+        except Exception as e:
+            last = e
+            if attempt < retries:
+                await asyncio.sleep(0.5)
+    # У asyncio.TimeoutError пустой str() — даём внятное сообщение всем вызывающим.
+    if isinstance(last, asyncio.TimeoutError):
+        raise TimeoutError(f"timeout >12s: {url}") from last
+    raise last
 
 
 # ---------------------------------------------------------------------------
@@ -115,24 +134,29 @@ def _extract_subcats(html: str, base_path: str) -> list[dict]:
     return items
 
 
-async def get_brands(category: str = "cars") -> list[dict]:
+async def get_brands(category: str = "cars", lang: str = "ru") -> list[dict]:
+    # Имена марок берём с локализованной версии страницы (ss.lv отдаёт нативно
+    # на ru/lv/en по префиксу URL); slug'и одинаковы на всех языках.
+    base_path = _loc(CATEGORIES[category], lang)
+    key = f"{lang}:{category}"
     async with _lock:
-        if category in _brand_cache:
-            return _brand_cache[category]
-    html = await _fetch(urljoin(BASE, CATEGORIES[category]))
-    brands = _extract_subcats(html, CATEGORIES[category])
+        if key in _brand_cache:
+            return _brand_cache[key]
+    html = await _fetch(urljoin(BASE, base_path))
+    brands = _extract_subcats(html, base_path)
     async with _lock:
-        _brand_cache[category] = brands
-    log.info(f"brands({category}): {len(brands)}")
+        _brand_cache[key] = brands
+    log.info(f"brands({category}, {lang}): {len(brands)}")
     return brands
 
 
-async def get_models(brand_slug: str, category: str = "cars") -> list[dict]:
-    key = f"{category}:{brand_slug}"
+async def get_models(brand_slug: str, category: str = "cars", lang: str = "ru") -> list[dict]:
+    # Названия моделей/серий — на языке пользователя («3 series» vs «3-я серия»).
+    key = f"{lang}:{category}:{brand_slug}"
     async with _lock:
         if key in _model_cache:
             return _model_cache[key]
-    base_path = f"{CATEGORIES[category]}{brand_slug}/"
+    base_path = f"{_loc(CATEGORIES[category], lang)}{brand_slug}/"
     try:
         html = await _fetch(urljoin(BASE, base_path))
         models = _extract_subcats(html, base_path)
@@ -225,40 +249,56 @@ async def _collapse_to_groups(items: list[dict], path: str) -> list[dict]:
     return out
 
 
-async def get_subcategories(path: str) -> list[dict]:
+_LANG_RE = re.compile(r"/(ru|lv|en)/")
+
+
+def _loc(p: str, lang: str) -> str:
+    """Меняет языковой префикс пути/URL ss.lv: /ru/ ↔ /lv/ ↔ /en/.
+
+    ss.lv отдаёт названия категорий нативно на трёх языках по префиксу URL,
+    поэтому переводить вручную не нужно — достаточно дёрнуть нужную версию.
+    """
+    lang = lang if lang in ("ru", "lv", "en") else "ru"
+    return _LANG_RE.sub(f"/{lang}/", p, count=1)
+
+
+async def get_subcategories(path: str, lang: str = "ru") -> list[dict]:
     """Скрейп подкатегорий со страницы категории ss.lv.
 
-    path — путь категории, например "/ru/transport/" или
-    "/ru/real-estate/flats/". Возвращает [{name, slug, url}] —
-    чистый первый уровень, как в навигации ss.lv (мега-меню сворачивается
-    до групп). Пустой результат означает «лист» (на странице объявления).
-    Результат кэшируется. При ошибке возвращает [].
+    path — каноничный путь («/ru/transport/»). Имена возвращаются на языке
+    `lang` (тянем /lv/ или /en/ версию страницы), а URL нормализуются обратно
+    к /ru/ — внутренняя навигация и мониторинг остаются на одном языке.
+    Возвращает [{name, slug, url}]. Пустой результат = «лист». Кэш — на язык.
     """
+    canon = _loc(path, "ru")          # внутренний (каноничный) путь
+    lpath = _loc(path, lang)          # путь на языке пользователя (для имён)
+    key   = f"{lang}:{canon}"
     async with _lock:
-        if path in _subcat_cache:
-            return _subcat_cache[path]
+        if key in _subcat_cache:
+            return _subcat_cache[key]
     try:
-        html  = await _fetch(urljoin(BASE, path))
-        items = _extract_a_category(html, path)
-        # Объединяем со ссылками/опциями нужного уровня: на страницах марок
-        # полный список моделей лежит в дропдауне «Модель» (a.a_category его
+        html  = await _fetch(urljoin(BASE, lpath))
+        items = _extract_a_category(html, lpath)
+        # Полный список моделей лежит в дропдауне «Модель» (a.a_category его
         # не видит — у Mercedes 29 серий vs 198 моделей в дропдауне).
         seen = {it["url"] for it in items}
-        for it in _extract_subcats(html, path):
-            url = path + it["slug"] + "/"
+        for it in _extract_subcats(html, lpath):
+            url = lpath + it["slug"] + "/"
             if url not in seen:
                 items.append({"name": it["name"], "slug": it["slug"], "url": url})
                 seen.add(url)
-        # Транспорт ss.lv показывает все виды плоско (включая водный, багги и
-        # т.п.) — не сворачиваем, чтобы было точь в точь как на сайте.
-        if path.rstrip("/") != "/ru/transport":
-            items = await _collapse_to_groups(items, path)
+        # Транспорт ss.lv показывает все виды плоско — не сворачиваем.
+        if canon.rstrip("/") != "/ru/transport":
+            items = await _collapse_to_groups(items, lpath)
+        # имена — на языке пользователя, URL нормализуем к каноничному /ru/
+        for it in items:
+            it["url"] = _loc(it["url"], "ru")
     except Exception as e:
-        log.warning(f"get_subcategories {path}: {e}")
+        log.warning(f"get_subcategories {lpath}: {e}")
         items = []
     async with _lock:
-        _subcat_cache[path] = items
-    log.info(f"subcategories({path}): {len(items)}")
+        _subcat_cache[key] = items
+    log.info(f"subcategories({lpath}): {len(items)}")
     return items
 
 
@@ -417,43 +457,52 @@ def build_url_with_params(base_url: str, params: dict) -> str:
 # ---------------------------------------------------------------------------
 # Date parsing
 # ---------------------------------------------------------------------------
-def parse_date_str(raw: str) -> str:
-    """Превращает ss.lv date-строку в читаемый формат.
+_MONTHS = {
+    "ru": ["", "янв", "фев", "мар", "апр", "мая", "июн",
+           "июл", "авг", "сен", "окт", "ноя", "дек"],
+    "en": ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
+    "lv": ["", "janv.", "febr.", "martā", "apr.", "maijā", "jūn.",
+           "jūl.", "aug.", "sept.", "okt.", "nov.", "dec."],
+}
+_DATE_WORDS = {
+    "ru": ("Сегодня", "Вчера", "в"),
+    "en": ("Today",   "Yesterday", "at"),
+    "lv": ("Šodien",  "Vakar", "plkst."),
+}
 
-    «сегодня 14:23»      → «Сегодня в 14:23»
-    «вчера 09:05»        → «Вчера в 09:05»
-    «25.05.»             → «25 мая»
-    «25.05.2025»         → «25.05.2025»
-    «šodien 14:23»       → «Сегодня в 14:23»
-    «vakar 14:23»        → «Вчера в 14:23»
+
+def parse_date_str(raw: str, lang: str = "ru") -> str:
+    """ss.lv date-строку → читаемый формат на нужном языке.
+
+    «сегодня 14:23» → «Сегодня в 14:23» / «Today at 14:23» / «Šodien plkst. 14:23»
+    «25.05.2025 14:23» → «25 мая 2025 в 14:23» / «25 May 2025 at 14:23» …
     """
     if not raw:
         return ""
+    lang = lang if lang in ("ru", "lv", "en") else "ru"
+    today, yesterday, at = _DATE_WORDS[lang]
     s = raw.strip()
 
-    # Лат. "šodien" / рус. "сегодня"
-    if re.search(r"šodien|сегодня|šodien", s, re.I):
+    if re.search(r"šodien|сегодня|today", s, re.I):
         t = re.search(r"(\d{1,2}:\d{2})", s)
-        return f"Сегодня в {t.group(1)}" if t else "Сегодня"
+        return f"{today} {at} {t.group(1)}" if t else today
 
-    # Лат. "vakar" / рус. "вчера"
-    if re.search(r"vakar|вчера", s, re.I):
+    if re.search(r"vakar|вчера|yesterday", s, re.I):
         t = re.search(r"(\d{1,2}:\d{2})", s)
-        return f"Вчера в {t.group(1)}" if t else "Вчера"
+        return f"{yesterday} {at} {t.group(1)}" if t else yesterday
 
-    # DD.MM.YYYY или DD.MM. (текущий год)
     m = re.match(r"(\d{1,2})\.(\d{1,2})\.(\d{4})?", s)
     if m:
         day, mon, year = m.group(1), m.group(2), m.group(3)
-        mon_names = ["", "янв", "фев", "мар", "апр", "мая", "июн",
-                     "июл", "авг", "сен", "окт", "ноя", "дек"]
+        months = _MONTHS[lang]
         try:
-            mon_idx = int(mon)
-            mon_str = mon_names[mon_idx] if 1 <= mon_idx <= 12 else mon
+            mi = int(mon)
+            mon_str = months[mi] if 1 <= mi <= 12 else mon
         except ValueError:
             mon_str = mon
         t = re.search(r"(\d{1,2}:\d{2})", s)
-        time_str = f" в {t.group(1)}" if t else ""
+        time_str = f" {at} {t.group(1)}" if t else ""
         if year:
             return f"{int(day)} {mon_str} {year}{time_str}"
         return f"{int(day)} {mon_str}{time_str}"
@@ -527,9 +576,10 @@ def _parse_row_city(tr) -> str:
 # Individual ad page: seller city + publish date
 # ---------------------------------------------------------------------------
 # «Лиепая и р-он» / «Рига, Центр» / «Cēsu nov.» → оставляем сам город
+# Требуем пробел ПЕРЕД суффиксом (\s+), иначе «Лимбажи и р-он» теряет «и».
 _CITY_SUFFIX_RE = re.compile(
-    r"\s*(?:и\s+)?(?:р-?он|р-?н|район|раj?\.?|nov\.?|novads|pag\.?|pagasts|"
-    r"un\s+raj\.?|и\s+р-?он)\.?\s*$",
+    r"\s+(?:и\s+)?(?:р-?он|р-?н|район|raj\.?|rajons|nov\.?|novads|"
+    r"pag\.?|pagasts|un\s+raj\.?|dist\.?|district)\.?\s*$",
     re.IGNORECASE,
 )
 
@@ -581,19 +631,39 @@ def _ad_options(soup) -> dict:
     return opts
 
 
+_ad_details_cache: dict[str, tuple] = {}   # url -> (ts_monotonic, out)
+_AD_DETAILS_TTL = 1800.0                    # 30 мин — карточка стабильна
+
+
 async def fetch_ad_details(url: str) -> dict:
     """Грузит страницу объявления: город, дата публикации, топливо и ПОЛНАЯ
     таблица характеристик (opts) для фильтров «из карточки» (КПП, кузов, цвет…).
 
     Возвращает {city, date_raw, date_fmt, fuel, opts}. При ошибке — пусто.
+
+    Кэш на 30 мин: одна и та же карточка открывается счётчиком «за сегодня»,
+    показом и монитором — без кэша это были бы 3+ сетевых запроса на объявление.
     """
-    out = {"city": "", "date_raw": "", "date_fmt": "", "fuel": "", "opts": {}}
+    now = time.monotonic()
+    hit = _ad_details_cache.get(url)
+    if hit and now - hit[0] < _AD_DETAILS_TTL:
+        return dict(hit[1])                 # копия верхнего уровня (opts read-only)
+
+    out = {"city": "", "date_raw": "", "date_fmt": "", "fuel": "", "opts": {},
+           "archived": False}
     try:
         html = await _fetch(url)
     except Exception as e:
         log.debug(f"fetch_ad_details {url}: {e}")
-        return out
+        return out                          # сбой НЕ кэшируем — повторим позже
     soup = BeautifulSoup(html, "lxml")
+    page_text = soup.get_text(" ", strip=True)
+
+    # Объявление ушло в архив (срок показа истёк) — уведомлять о нём не нужно.
+    out["archived"] = bool(re.search(
+        r"в\s+архиве|срок показа законч|atrodas arhīv|rādīšanas termiņš\s+ir\s+beidz|"
+        r"in the archive|display period",
+        page_text, re.I))
 
     opts = _ad_options(soup)
     out["opts"] = opts
@@ -602,13 +672,16 @@ async def fetch_ad_details(url: str) -> dict:
 
     # Дата публикации в футере: «Дата: 17.06.2026 14:53» (всегда со временем)
     m = re.search(
-        r"(?:Дата|Datums)\s*:?\s*(\d{1,2}\.\d{1,2}\.\d{4}\s+\d{1,2}:\d{2})",
-        soup.get_text(" ", strip=True),
+        r"(?:Дата|Datums|Date)\s*:?\s*(\d{1,2}\.\d{1,2}\.\d{4}\s+\d{1,2}:\d{2})",
+        page_text,
     )
     if m:
         out["date_raw"] = m.group(1)
         out["date_fmt"] = parse_date_str(m.group(1))
-    return out
+    if len(_ad_details_cache) > 4000:           # не растём бесконечно за годы работы
+        _ad_details_cache.clear()
+    _ad_details_cache[url] = (now, out)
+    return dict(out)
 
 
 # ---------------------------------------------------------------------------
@@ -735,6 +808,164 @@ async def fetch_listings(url: str) -> list[dict]:
     return ads
 
 
+async def get_today(url: str) -> tuple[int, Optional[str]]:
+    """Сколько объявлений выложено СЕГОДНЯ в разделе ss.lv + URL выдачи за сегодня.
+
+    На странице раздела есть дропдаун периода с опцией «Сегодня (N)» — её value
+    это и есть ссылка на сегодняшнюю выдачу, а N в скобках — счётчик. Соседние
+    «За 2 дня»/«За 5 дней» имеют slug today-2/today-5, поэтому берём строго
+    сегмент `/today/`. Нет опции (0 за сегодня) → (0, None).
+
+    Особый случай — разделы-АГРЕГАТОРЫ (напр. вакансии `/ru/work/are-required/`):
+    голый URL показывает только меню профессий (0 объявлений, без опции периода),
+    а вся выдача и счётчик «Сегодня (N)» живут на `<url>today/`. Поэтому если на
+    голой странице опции нет — пробуем один раз `<url>today/`.
+    """
+    pc = await get_period_counts(url)
+    if "today" in pc:
+        return pc["today"]
+    if not url.rstrip("/").endswith("/today"):
+        alt = (url if url.endswith("/") else url + "/") + "today/"
+        pc = await get_period_counts(alt)
+        if "today" in pc:
+            return pc["today"]
+    return 0, None
+
+
+async def get_period_counts(url: str) -> dict:
+    """Все опции периода на странице раздела: {'today': (n, url),
+    'today-2': (n, url), 'today-5': (n, url)}. Отсутствующий ключ = опции нет.
+    Нужно для фолбэка, когда за сегодня 0, но за 2/5 дней есть — чтобы карточка
+    фильтра не выглядела «пусто/сломано»."""
+    out: dict[str, tuple] = {}
+    try:
+        soup = BeautifulSoup(await _fetch(url), "lxml")
+    except Exception as e:
+        log.warning(f"get_period_counts {url}: {e}")
+        return out
+    for o in soup.find_all("option"):
+        val = (o.get("value") or "").strip()
+        m = re.search(r"/(today(?:-\d+)?)/", val)
+        if not m:
+            continue
+        cnt = re.search(r"\((\d+)\)", o.get_text(" ", strip=True))
+        # На странице несколько опций с одним /today/ (Сегодня (N), Список, Все…);
+        # опция со счётчиком «(N)» — приоритетная, не даём её затереть пустой.
+        if cnt or m.group(1) not in out:
+            out[m.group(1)] = (int(cnt.group(1)) if cnt else 0, urljoin(BASE, val))
+    return out
+
+
+async def get_recent(url: str) -> tuple[Optional[str], int, Optional[str]]:
+    """Самая свежая НЕпустая выдача раздела: сегодня → за 2 дня → за 5 дней.
+    Возвращает (период, count, url), период ∈ {'today','today-2','today-5'} или None.
+
+    Фильтр периода есть в КАЖДОМ разделе ss.lv, поэтому «свежие объявления»
+    можно показать везде — даже когда за сегодня 0 (берём 2/5 дней). Для
+    разделов-агрегаторов (вакансии: голый URL — меню) периоды живут на
+    `<url>today/`, поэтому при пустом результате пробуем и его.
+    """
+    async def _pick(u):
+        pc = await get_period_counts(u)
+        for key in ("today", "today-2", "today-5"):
+            if pc.get(key) and pc[key][0] > 0:
+                return key, pc[key][0], pc[key][1]
+        return None
+    try:
+        r = await _pick(url)
+    except Exception as e:
+        log.warning(f"get_recent {url}: {e}")
+        return None, 0, None
+    if r:
+        return r
+    if not url.rstrip("/").endswith("/today"):
+        alt = (url if url.endswith("/") else url + "/") + "today/"
+        try:
+            r2 = await _pick(alt)
+            if r2:
+                return r2
+        except Exception:
+            pass
+    return None, 0, None
+
+
+async def get_regions(url: str) -> list[str]:
+    """Список регионов из формы раздела (Рига, Юрмала, Рижский р-он…).
+
+    Гео у вакансий/работы — POST-форма, в URL не воспроизводится; район в данных
+    бота не виден. Но РЕГИОН можно фильтровать клиентски по городу из карточки.
+    Регион-селект — тот, где есть опция «Рига» с числовым value.
+    """
+    try:
+        soup = BeautifulSoup(await _fetch(url), "lxml")
+    except Exception as e:
+        log.warning(f"get_regions {url}: {e}")
+        return []
+    for sel in soup.find_all("select"):
+        opts = sel.find_all("option")
+        if not any(o.get_text(strip=True) == "Рига" and (o.get("value") or "").strip().isdigit()
+                   for o in opts):
+            continue
+        out = []
+        for o in opts:
+            txt = o.get_text(" ", strip=True)
+            if txt and (o.get("value") or "").strip().isdigit():
+                out.append(txt)
+        return out
+    return []
+
+
+def _first_word(s: str) -> str:
+    parts = (s or "").strip().lower().split()
+    return parts[0] if parts else ""
+
+
+async def get_region_districts(region_name: str, lang: str = "ru") -> list[str]:
+    """Подрайоны региона для гео-фильтра вакансий (Рига→Плявниеки, Юрмала→Майори,
+    Лиепая и р-он→Лиепая/Гробиня…).
+
+    Названия берём из справочника недвижимости `/ru/real-estate/flats/<регион>/`
+    — они совпадают с полем «Местонахождение» в карточке вакансии, по которому
+    идёт клиентский матч. Регион сопоставляем по первому слову названия
+    (вакансии «Лиепая и р-он» ↔ недвиж. «Лиепая и район»).
+    """
+    if not (region_name or "").strip():
+        return []
+    key = _first_word(region_name)
+    try:
+        regs = await get_subcategories("/ru/real-estate/flats/", lang)
+    except Exception as e:
+        log.warning(f"get_region_districts regions: {e}")
+        return []
+    url = next((r["url"] for r in regs if _first_word(r.get("name", "")) == key), None)
+    if not url:
+        return []
+    try:
+        subs = await get_subcategories(url, lang)
+    except Exception as e:
+        log.warning(f"get_region_districts {url}: {e}")
+        return []
+    return [s["name"] for s in subs if s.get("name")]
+
+
+def clear_caches() -> dict:
+    """Сбросить все парсер-кэши (для само-лечения /diag, когда ss.lv сменил
+    структуру/слаги). Возвращает сколько записей сброшено по каждому кэшу."""
+    sizes = {
+        "brands":   len(_brand_cache),
+        "models":   len(_model_cache),
+        "filters":  len(_filter_cache),
+        "subcats":  len(_subcat_cache),
+        "catfilt":  len(_catfilter_cache),
+        "cols":     len(_listing_cols_cache),
+        "addetails": len(_ad_details_cache),
+    }
+    for d in (_brand_cache, _model_cache, _filter_cache, _subcat_cache,
+              _catfilter_cache, _listing_cols_cache, _ad_details_cache):
+        d.clear()
+    return sizes
+
+
 def apply_keyword(ads: list[dict], keyword: Optional[str]) -> list[dict]:
     if not keyword:
         return ads
@@ -834,18 +1065,42 @@ def _match_adopt_label(opts: list[str], ad_opts: dict) -> Optional[str]:
     return None
 
 
-async def get_category_filters(url: str) -> list[dict]:
+def _form_value_map(soup) -> dict[str, dict[str, str]]:
+    """{имя_селекта: {value_id: текст_опции}} формы фильтра.
+
+    value_id (числовой) стабилен между языками, а порядок и текст опций — нет
+    (ss.lv сортирует опции по алфавиту локализованного текста). Поэтому
+    ru↔en/lv сопоставляем по (имя селекта, value_id), а не по позиции.
+    """
+    form = soup.find("form", id="filter_frm") or soup.find("form")
+    res: dict[str, dict[str, str]] = {}
+    for sel in (form.find_all("select") if form else []):
+        name = sel.get("name") or ""
+        if not name or name == "sid" or "[min]" in name or "[max]" in name:
+            continue
+        res[name] = {
+            (o.get("value") or "").strip(): o.get_text(" ", strip=True)
+            for o in sel.find_all("option")
+            if (o.get("value") or "").strip() not in ("", "-1")
+        }
+    return res
+
+
+async def get_category_filters(url: str, lang: str = "ru") -> list[dict]:
     """Фильтры конкретной категории, применимые на стороне бота.
 
     Берёт селекты формы фильтра и привязывает каждый к источнику значения:
       - source="col"   — значение есть в КОЛОНКЕ списка (Консоль, Сост.);
       - source="adopt" — значение есть в КАРТОЧКЕ объявления (КПП, кузов, цвет,
                          топливо) — монитор всё равно грузит карточку.
-    Возвращает [{label, options:[str], source}].
+    Возвращает [{label, options:[str], source, options_disp:[str]}].
+    `options` — всегда РУССКИЕ (по ним матчим карточку на каноничном /ru/),
+    `options_disp` — на языке `lang` (только для показа в боте).
     """
+    key = f"{lang}:{url}"
     async with _lock:
-        if url in _catfilter_cache:
-            return _catfilter_cache[url]
+        if key in _catfilter_cache:
+            return _catfilter_cache[key]
     out: list[dict] = []
     try:
         soup   = BeautifulSoup(await _fetch(url), "lxml")
@@ -900,8 +1155,24 @@ async def get_category_filters(url: str) -> list[dict]:
                 label = _match_adopt_label(opts, ad_opts)
                 if label:
                     out.append({"label": label, "options": opts, "source": "adopt"})
+
+        # Локализация ПОКАЗА значений опций (значения для матчинга остаются ru).
+        for f in out:
+            f["options_disp"] = list(f["options"])
+        if lang != "ru" and out:
+            loc_soup = BeautifulSoup(await _fetch(_loc(url, lang)), "lxml")
+            ru_map, loc_map = _form_value_map(soup), _form_value_map(loc_soup)
+            trans: dict[str, str] = {}
+            for name, vals in ru_map.items():
+                lvals = loc_map.get(name, {})
+                for vid, rutext in vals.items():
+                    loc = lvals.get(vid)
+                    if loc and loc != rutext:
+                        trans[rutext] = loc
+            for f in out:
+                f["options_disp"] = [trans.get(o, o) for o in f["options"]]
     except Exception as e:
         log.warning(f"get_category_filters {url}: {e}")
     async with _lock:
-        _catfilter_cache[url] = out
+        _catfilter_cache[key] = out
     return out

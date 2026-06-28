@@ -5,5 +5,9 @@ services:
     container_name: sslv-bot
     restart: unless-stopped
     env_file: .env
+    environment:
+      # Принудительно кладём БД на смонтированный том, даже если в .env DB_PATH=data.db.
+      # Иначе data.db пишется внутрь контейнера и теряется при рестарте/ребуте.
+      DB_PATH: /app/data/data.db
     volumes:
       - ./data:/app/data

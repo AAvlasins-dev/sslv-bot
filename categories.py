@@ -150,11 +150,11 @@ TRANSPORT_FULL = {
 # «Редкие авто» — спец-разделы легковых, не привязанные к марке.
 # Идут как простые подкатегории (сразу к меню фильтров).
 CARS_SPECIAL = [
-    ("🏛 Ретро авто",       "/ru/transport/cars/retro-cars/"),
-    ("🏎 Спортивные",       "/ru/transport/cars/sport-cars/"),
-    ("🛠 Тюнингованые",     "/ru/transport/cars/tuned-cars/"),
-    ("💎 Эксклюзивные",     "/ru/transport/cars/exclusive-cars/"),
-    ("⚡ Электромобили",    "/ru/transport/cars/electric-cars/"),
+    ({"ru": "🏛 Ретро авто",    "en": "🏛 Retro cars",     "lv": "🏛 Retro auto"},      "/ru/transport/cars/retro-cars/"),
+    ({"ru": "🏎 Спортивные",    "en": "🏎 Sport cars",     "lv": "🏎 Sporta auto"},     "/ru/transport/cars/sport-cars/"),
+    ({"ru": "🛠 Тюнингованые",  "en": "🛠 Tuned cars",     "lv": "🛠 Tūningoti auto"},  "/ru/transport/cars/tuned-cars/"),
+    ({"ru": "💎 Эксклюзивные",  "en": "💎 Exclusive cars", "lv": "💎 Ekskluzīvi auto"}, "/ru/transport/cars/exclusive-cars/"),
+    ({"ru": "⚡ Электромобили", "en": "⚡ Electric cars",  "lv": "⚡ Elektroauto"},     "/ru/transport/cars/electric-cars/"),
 ]
 
 # Настройки интервала мониторинга

@@ -11,7 +11,7 @@
 [![CI](https://github.com/AAvlasins-dev/sslv-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/AAvlasins-dev/sslv-bot/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Viewing%20only-red)](#-license)
 
-🇬🇧 [English](#-english) · 🇷🇺 [Русский](#-русский) · 🇱🇻 [Latviešu](#-latviešu)
+🇬🇧 [English](#-english) · 🇱🇻 [Latviešu](#-latviešu) · 🇷🇺 [Русский](#-русский)
 
 </div>
 
@@ -34,7 +34,7 @@ Each notification includes a direct link, price, posting date, the seller's city
 | 🎛️ | **Real per-category filters** — the bot scrapes each category's actual ss.lv filter form (price, year, mileage, fuel, gearbox, body, colour, console, condition, location…) and lets you set them |
 | 📍 | **Distance to seller** — set your location once (`/location`); every notification shows how far the seller is, via a built-in 100+ Latvian-city geocoder + OpenStreetMap fallback |
 | 📅 | **Smart date parsing** — understands ss.lv formats (`сегодня`, `vakar`, `DD.MM.YYYY`) and pulls the exact publish time from each ad |
-| 🗣️ | **Trilingual UI** — Russian, Latvian, English, switchable on the fly |
+| 🗣️ | **Bilingual UI** — Russian & Latvian, switchable on the fly (names, categories and filter values come **natively localized** from ss.lv's own `/lv/` pages) |
 | 🔔 | **Instant, de-duplicated alerts** — never the same ad twice; per-filter check interval (1 min … 2 h) |
 | 💾 | **Persistent** — filters and seen-ads live in SQLite, survive restarts |
 | 🐳 | **Production-ready** — Docker / docker-compose, Railway config, GitHub Actions CI, unit tests |
@@ -72,68 +72,8 @@ Two problems made this more than a simple scraper:
 | `/list` | view & delete filters |
 | `/stats` | monitoring statistics |
 | `/location` | set your location (GPS or city name) |
-| `/lang` | switch interface language |
+| `/lang` | switch interface language (RU / LV) |
 | `/cancel` | cancel current action |
-
----
-
-<a name="-русский"></a>
-## 🇷🇺 Русский
-
-### Что делает
-
-Ты выбираешь, *что* отслеживать на ss.lv — **любую категорию, подкатегорию, любой фильтр** — а бот в фоне опрашивает сайт и присылает уведомление в Telegram, как только появляется новое подходящее объявление. Авто, недвижимость, электроника, работа, животные, услуги… весь сайт.
-
-В каждом уведомлении — прямая ссылка, цена, дата публикации, город продавца **и расстояние от тебя до него в км**.
-
-### ✨ Возможности
-
-| | Возможность |
-|---|---|
-| 🌐 | **Мониторит весь ss.lv** — все 12 разделов и ~7 600+ конечных подкатегорий, навигация **динамическая** (дерево не захардкожено — меню повторяет живой сайт) |
-| 🎛️ | **Реальные фильтры каждой категории** — бот скрейпит настоящую форму фильтра ss.lv (цена, год, пробег, топливо, КПП, кузов, цвет, консоль, состояние, местоположение…) |
-| 📍 | **Расстояние до продавца** — задаёшь своё место один раз (`/location`), и каждое уведомление показывает, сколько км до продавца (встроенная база 100+ городов Латвии + OpenStreetMap-фолбэк) |
-| 📅 | **Парсинг даты** — понимает форматы ss.lv (`сегодня`, `vakar`, `DD.MM.YYYY`) и достаёт точное время публикации |
-| 🗣️ | **Три языка** — русский, латышский, английский, переключаются на лету |
-| 🔔 | **Мгновенные уведомления без дублей** — одно объявление никогда не придёт дважды; свой интервал проверки на каждый фильтр (1 мин … 2 ч) |
-| 💾 | **Сохранность** — фильтры и просмотренные объявления в SQLite, переживают перезапуск |
-| 🐳 | **Готов к продакшену** — Docker / docker-compose, конфиг Railway, CI на GitHub Actions, юнит-тесты |
-
-### 💬 Пример уведомления
-
-```
-🆕 BMW 5 серия
-
-BMW 520d Touring xDrive
-2019 | 2.0 D | 130 000 км | Автомат
-💰 22 500 €
-📅 Сегодня в 09:12
-📍 Jelgava — 43 км от вас
-
-Открыть объявление →
-```
-
-### 🧠 Как это устроено (самое интересное)
-
-Две задачи сделали проект сложнее обычного скрапера:
-
-1. **У ss.lv нет публичного API, а дерево категорий — глубокое и неоднородное.**
-   Вместо тысяч захардкоженных URL бот рассматривает сайт как граф: один универсальный краулер обходит его по родной навигации сайта (ссылки `a.a_category` **и** выпадающие списки моделей `<select>`), спускаясь до страницы с объявлениями. *Транспорт → Авто → BMW → 320 → Дизель* или *Недвижимость → Квартиры → Рига → Центр* — один и тот же код, любая глубина.
-
-2. **Фильтрация ss.lv работает через POST/сессию — отфильтрованную выдачу нельзя воспроизвести сохранённым URL.**
-   Поэтому фильтрация **на стороне бота**: таблица объявлений разбирается на именованные колонки (цена, год, консоль, состояние…) и фильтруется там; характеристики, которые есть только в карточке (КПП, кузов, цвет, топливо), матчатся из карточки, которую монитор и так загружает ради даты и города — **без лишних запросов**.
-
-### 🕹️ Команды
-
-| Команда | Действие |
-|---|---|
-| `/start` | запуск / главное меню |
-| `/add` | добавить фильтр (меню повторяет ss.lv) |
-| `/list` | список и удаление фильтров |
-| `/stats` | статистика мониторинга |
-| `/location` | задать местоположение (GPS или город) |
-| `/lang` | сменить язык интерфейса |
-| `/cancel` | отменить текущее действие |
 
 ---
 
@@ -154,7 +94,7 @@ Katrā paziņojumā ir tieša saite, cena, publicēšanas datums, pārdevēja pi
 | 🎛️ | **Reālie katras kategorijas filtri** — bots nolasa īsto ss.lv filtru formu (cena, gads, nobraukums, degviela, ātrumkārba, virsbūve, krāsa, konsole, stāvoklis, atrašanās vieta…) |
 | 📍 | **Attālums līdz pārdevējam** — norādi savu atrašanās vietu vienreiz (`/location`), un katrs paziņojums rāda attālumu km (iebūvēta 100+ Latvijas pilsētu datubāze + OpenStreetMap rezerves variants) |
 | 📅 | **Datuma parsēšana** — saprot ss.lv formātus (`šodien`, `vakar`, `DD.MM.GGGG`) un izvelk precīzu publicēšanas laiku |
-| 🗣️ | **Trīs valodas** — krievu, latviešu, angļu, pārslēdzamas uzreiz |
+| 🗣️ | **Divvalodu saskarne** — krievu un latviešu, pārslēdzama uzreiz (nosaukumus, kategorijas un filtru vērtības **lokalizē pats ss.lv** ar savām `/lv/` lapām) |
 | 🔔 | **Tūlītēji paziņojumi bez dublikātiem** — viens sludinājums nekad nepienāks divreiz; atsevišķs pārbaudes intervāls katram filtram (1 min … 2 h) |
 | 💾 | **Saglabāšana** — filtri un redzētie sludinājumi SQLite datubāzē, pārdzīvo pārstartēšanu |
 | 🐳 | **Gatavs ražošanai** — Docker / docker-compose, Railway konfigurācija, GitHub Actions CI, vienībtesti |
@@ -192,8 +132,68 @@ Divas problēmas padarīja šo par vairāk nekā parastu skreperi:
 | `/list` | filtru saraksts un dzēšana |
 | `/stats` | uzraudzības statistika |
 | `/location` | norādīt atrašanās vietu (GPS vai pilsēta) |
-| `/lang` | mainīt saskarnes valodu |
+| `/lang` | mainīt saskarnes valodu (RU / LV) |
 | `/cancel` | atcelt pašreizējo darbību |
+
+---
+
+<a name="-русский"></a>
+## 🇷🇺 Русский
+
+### Что делает
+
+Ты выбираешь, *что* отслеживать на ss.lv — **любую категорию, подкатегорию, любой фильтр** — а бот в фоне опрашивает сайт и присылает уведомление в Telegram, как только появляется новое подходящее объявление. Авто, недвижимость, электроника, работа, животные, услуги… весь сайт.
+
+В каждом уведомлении — прямая ссылка, цена, дата публикации, город продавца **и расстояние от тебя до него в км**.
+
+### ✨ Возможности
+
+| | Возможность |
+|---|---|
+| 🌐 | **Мониторит весь ss.lv** — все 12 разделов и ~7 600+ конечных подкатегорий, навигация **динамическая** (дерево не захардкожено — меню повторяет живой сайт) |
+| 🎛️ | **Реальные фильтры каждой категории** — бот скрейпит настоящую форму фильтра ss.lv (цена, год, пробег, топливо, КПП, кузов, цвет, консоль, состояние, местоположение…) |
+| 📍 | **Расстояние до продавца** — задаёшь своё место один раз (`/location`), и каждое уведомление показывает, сколько км до продавца (встроенная база 100+ городов Латвии + OpenStreetMap-фолбэк) |
+| 📅 | **Парсинг даты** — понимает форматы ss.lv (`сегодня`, `vakar`, `DD.MM.YYYY`) и достаёт точное время публикации |
+| 🗣️ | **Два языка интерфейса** — русский и латышский, переключаются на лету (названия, категории и значения фильтров **локализует сам ss.lv** своими `/lv/` страницами) |
+| 🔔 | **Мгновенные уведомления без дублей** — одно объявление никогда не придёт дважды; свой интервал проверки на каждый фильтр (1 мин … 2 ч) |
+| 💾 | **Сохранность** — фильтры и просмотренные объявления в SQLite, переживают перезапуск |
+| 🐳 | **Готов к продакшену** — Docker / docker-compose, конфиг Railway, CI на GitHub Actions, юнит-тесты |
+
+### 💬 Пример уведомления
+
+```
+🆕 BMW 5 серия
+
+BMW 520d Touring xDrive
+2019 | 2.0 D | 130 000 км | Автомат
+💰 22 500 €
+📅 Сегодня в 09:12
+📍 Jelgava — 43 км от вас
+
+Открыть объявление →
+```
+
+### 🧠 Как это устроено (самое интересное)
+
+Две задачи сделали проект сложнее обычного скрапера:
+
+1. **У ss.lv нет публичного API, а дерево категорий — глубокое и неоднородное.**
+   Вместо тысяч захардкоженных URL бот рассматривает сайт как граф: один универсальный краулер обходит его по родной навигации сайта (ссылки `a.a_category` **и** выпадающие списки моделей `<select>`), спускаясь до страницы с объявлениями. *Транспорт → Авто → BMW → 320 → Дизель* или *Недвижимость → Квартиры → Рига → Центр* — один и тот же код, любая глубина.
+
+2. **Фильтрация ss.lv работает через POST/сессию — отфильтрованную выдачу нельзя воспроизвести сохранённым URL.**
+   Поэтому фильтрация **на стороне бота**: таблица объявлений разбирается на именованные колонки (цена, год, консоль, состояние…) и фильтруется там; характеристики, которые есть только в карточке (КПП, кузов, цвет, топливо), матчатся из карточки, которую монитор и так загружает ради даты и города — **без лишних запросов**.
+
+### 🕹️ Команды
+
+| Команда | Действие |
+|---|---|
+| `/start` | запуск / главное меню |
+| `/add` | добавить фильтр (меню повторяет ss.lv) |
+| `/list` | список и удаление фильтров |
+| `/stats` | статистика мониторинга |
+| `/location` | задать местоположение (GPS или город) |
+| `/lang` | сменить язык интерфейса (RU / LV) |
+| `/cancel` | отменить текущее действие |
 
 ---
 
@@ -222,7 +222,7 @@ sslv-bot/
 ├── cache.py           # in-memory cache + startup preload
 ├── categories.py      # top-level category map & fallbacks
 ├── filters_config.py  # range-filter presets (price/year/mileage…)
-├── i18n.py            # RU / LV / EN translations
+├── i18n.py            # RU / LV interface translations
 ├── config.py          # env configuration
 ├── tests/             # unit tests (geo + date parsing)
 └── .github/workflows/ # CI

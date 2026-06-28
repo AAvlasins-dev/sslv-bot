@@ -4,12 +4,15 @@ ss.lv Monitor Bot — полная версия.
 """
 import asyncio
 import logging
+from datetime import datetime
+from html import escape as _esc
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
+    BotCommandScopeChat,
     CallbackQuery, InlineKeyboardButton,
     KeyboardButton, Message,
     ReplyKeyboardMarkup, ReplyKeyboardRemove,
@@ -27,13 +30,14 @@ from i18n import t
 import cache
 import filters_config as fc
 import parser as p
+import monitor
 
 log = logging.getLogger("bot")
 router = Router()
 
 BRANDS_PER_PAGE = br.PAGE_SIZE
 CITIES_PER_PAGE = 15
-SUBS_PER_PAGE   = 9
+SUBS_PER_PAGE   = 8   # по 2 в ряд → 4 строки, помещается на один экран
 
 
 # ─────────────────────────────────────────────
@@ -57,8 +61,7 @@ class AddFilter(StatesGroup):
     interval      = State()
 
 class SetLocation(StatesGroup):
-    waiting   = State()
-    city_page = State()
+    waiting = State()
 
 class SetLang(StatesGroup):
     picking = State()
@@ -123,15 +126,19 @@ MENU_BTNS = {
         "list":     "📋 Мои фильтры",
         "stats":    "📊 Статистика",
         "location": "📍 Моё место",
-        "lang":     "🌐 Язык",
+        "lang":     "🌐 LV/RU",
+        "diag":     "🩺 Диагностика",
     },
     "lv": {
         "add":      "➕ Pievienot filtru",
         "list":     "📋 Mani filtri",
         "stats":    "📊 Statistika",
         "location": "📍 Mana vieta",
-        "lang":     "🌐 Valoda",
+        "lang":     "🌐 LV/RU",
+        "diag":     "🩺 Diagnostika",
     },
+    # «en» оставлен только для маршрутизации старых (англ.) клавиатур у юзеров,
+    # что выбирали English до перехода на ru/lv. Новые клавиатуры — ru/lv.
     "en": {
         "add":      "➕ Add filter",
         "list":     "📋 My filters",
@@ -159,7 +166,10 @@ def main_kb(lang: str) -> ReplyKeyboardMarkup:
     kb.row(
         KeyboardButton(text=b["stats"]),
         KeyboardButton(text=b["location"]),
+    )
+    kb.row(
         KeyboardButton(text=b["lang"]),
+        KeyboardButton(text=b.get("diag", "🩺")),
     )
     return kb.as_markup(resize_keyboard=True, persistent=True)
 
@@ -180,56 +190,124 @@ def _parse_range(s: str):
 
 
 async def _edit(msg: Message, text: str, **kw):
-    try:    await msg.edit_text(text, **kw)
-    except: await msg.answer(text, **kw)
+    """Показать следующий экран меню НОВЫМ сообщением внизу чата.
+
+    Раньше тут был edit_text (правка на месте), но Telegram при росте меню
+    проматывал к ВЕРХУ редактируемого сообщения — отсюда «прыжок вверх».
+    Теперь шлём НОВОЕ сообщение и удаляем старое: клиент сам проматывает чат
+    ВНИЗ к свежему меню. Сначала отправка, потом удаление — чтобы при сбое
+    отправки чат не остался пустым.
+    """
+    try:
+        new = await msg.answer(text, **kw)
+        try:    await msg.delete()
+        except Exception: pass
+        return new
+    except Exception as e:
+        log.warning(f"_edit send failed: {e}")
+        try:    return await msg.edit_text(text, **kw)   # фолбэк: правка на месте
+        except Exception: return msg
+
+
+def _grid(kb: InlineKeyboardBuilder, btns: list, wide: int = 3):
+    """Разложить кнопки рядами так, чтобы подписи НЕ обрезались ни на каком языке.
+
+    Чем длиннее самая длинная подпись — тем меньше колонок (шире кнопки):
+    >24 символов → по 1 в ряд, >12 → по 2, иначе → `wide`. Так длинные названия
+    (особенно латышские) получают полную ширину и помещаются целиком.
+    """
+    if not btns:
+        return
+    m = max(len(b.text) for b in btns)
+    cols = 1 if m > 24 else (2 if m > 12 else wide)
+    for i in range(0, len(btns), cols):
+        kb.row(*btns[i:i + cols])
+
+
+async def _top_cats(lang: str) -> list[dict]:
+    """Верхние категории = курируемые 12 (свои эмодзи/порядок) + автоматически
+    подхваченные НОВЫЕ из корня ss.lv. Если ss.lv когда-нибудь добавит новый
+    верхний раздел — он появится в боте сам, с нативным именем на двух языках и
+    эмодзи 📁, без правок кода. Кэш на язык (TTL ~1ч) → работает годами.
+    """
+    key = f"topcats:{lang}"
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    cats = [{"id": c["id"], "path": c["path"], "type": c["type"],
+             "label": i18n.cat_label(c["id"], lang)} for c in cat_mod.TOP_CATEGORIES]
+    known = {p._loc(c["path"], "ru").rstrip("/") for c in cats}
+    try:
+        root = await asyncio.wait_for(p.get_subcategories("/ru/", lang), timeout=10)
+        for r in root:
+            canon = p._loc(r.get("url", ""), "ru").rstrip("/")
+            if canon and canon not in known:
+                cats.append({"id": "auto:" + r["slug"], "path": canon + "/",
+                             "type": "simple", "label": "📁 " + r["name"]})
+                known.add(canon)
+                log.info("автоподхват новой верхней категории: %s", r["name"])
+    except Exception as e:
+        log.warning("top cats autodiscover: %s", e)
+    cache.put(key, cats)
+    return cats
 
 
 async def _lang(user_id: int) -> str:
     u = await db.get_user(user_id)
-    return (u or {}).get("lang") or "ru"
+    l = (u or {}).get("lang") or "ru"
+    return l if l in ("ru", "lv") else "ru"   # интерфейс только ru/lv
 
 
 def _brand_list(category: str):
     return br.CAR_BRANDS if category == "cars" else br.MOTO_BRANDS
 
 
-def _interval_label(sec: int) -> str:
-    for label, s in cat_mod.INTERVALS:
-        if s == sec: return label.split(" ", 1)[1]
-    m = sec // 60
-    return f"{m} мин" if m < 60 else f"{m//60} ч"
+def _interval_label(sec: int, lang: str = "ru") -> str:
+    u = {"ru": ("мин", "ч"), "en": ("min", "h"), "lv": ("min.", "st.")}.get(lang, ("мин", "ч"))
+    return f"{sec//3600} {u[1]}" if sec % 3600 == 0 else f"{sec//60} {u[0]}"
 
 
-def _filter_summary(data: dict) -> str:
+# Метки сводки фильтра по языкам
+_SUMMARY_L = {
+    "ru": {"price":"💶 Цена","year":"📅 Год","mileage":"🛣 Пробег","engine":"🔧 Двигатель",
+           "area":"📐 Площадь","none":"Фильтры не заданы","from":"от","to":"до","km":" км"},
+    "en": {"price":"💶 Price","year":"📅 Year","mileage":"🛣 Mileage","engine":"🔧 Engine",
+           "area":"📐 Area","none":"No filters set","from":"from","to":"up to","km":" km"},
+    "lv": {"price":"💶 Cena","year":"📅 Gads","mileage":"🛣 Nobraukums","engine":"🔧 Dzinējs",
+           "area":"📐 Platība","none":"Filtri nav iestatīti","from":"no","to":"līdz","km":" km"},
+}
+
+
+def _filter_summary(data: dict, lang: str = "ru") -> str:
+    L = _SUMMARY_L.get(lang, _SUMMARY_L["ru"])
     def rng(a, b, u=""):
         if a and b: return f"{a}–{b}{u}"
-        if a: return f"от {a}{u}"
-        if b: return f"до {b}{u}"
+        if a: return f"{L['from']} {a}{u}"
+        if b: return f"{L['to']} {b}{u}"
         return None
     lines = []
     r = rng(data.get("price_min"),  data.get("price_max"),  " €")
-    if r: lines.append(f"💶 Цена: {r}")
+    if r: lines.append(f"{L['price']}: {r}")
     r = rng(data.get("year_min"),   data.get("year_max"))
-    if r: lines.append(f"📅 Год: {r}")
-    r = rng(data.get("mile_min"),   data.get("mile_max"),   " км")
-    if r: lines.append(f"🛣 Пробег: {r}")
-    r = rng(data.get("engine_min"), data.get("engine_max"), " куб")
-    if r: lines.append(f"🔧 Двигатель: {r}")
-    r = rng(data.get("area_min"),   data.get("area_max"),   " м²")
-    if r: lines.append(f"📐 Площадь: {r}")
-    for key, icon, label in [
-        ("fuel","⛽","Топливо"),("gearbox","⚙️","КПП"),("bodytype","🚙","Кузов"),
-        ("drive","🔄","Привод"),("color","🎨","Цвет"),("rooms","🚪","Комнат"),
-        ("floor","🏢","Этаж"),("condition","✨","Состояние"),
-        ("size","📏","Размер"),("experience","📋","Опыт"),("keyword","🔎","Слово"),
-    ]:
-        v = data.get(key)
-        if v: lines.append(f"{icon} {label}: {v}")
+    if r: lines.append(f"{L['year']}: {r}")
+    r = rng(data.get("mile_min"),   data.get("mile_max"),   L['km'])
+    if r: lines.append(f"{L['mileage']}: {r}")
+    r = rng(data.get("engine_min"), data.get("engine_max"), " cc")
+    if r: lines.append(f"{L['engine']}: {r}")
+    r = rng(data.get("area_min"),   data.get("area_max"),   " m²")
+    if r: lines.append(f"{L['area']}: {r}")
+    # Значения опций храним по-русски (для матчинга), показываем локализованно.
+    vmap: dict[str, str] = {}
+    for f in (data.get("cat_filters") or []):
+        for ru_v, disp_v in zip(f.get("options", []), f.get("options_disp") or f.get("options", [])):
+            vmap[ru_v] = disp_v
     for label, val in (data.get("cols_sel") or {}).items():
-        lines.append(f"🔹 {label}: {val}")
+        lines.append(f"🔹 {i18n.filter_label(label, lang)}: {vmap.get(val, val)}")
     for label, val in (data.get("adopts_sel") or {}).items():
-        lines.append(f"🔹 {label}: {val}")
-    return "\n".join(lines) if lines else "Фильтры не заданы"
+        lines.append(f"🔹 {i18n.filter_label(label, lang)}: {vmap.get(val, val)}")
+    if data.get("keyword"):
+        lines.append(f"🔎 {_esc(str(data['keyword']))}")
+    return "\n".join(lines) if lines else L["none"]
 
 
 async def _show_filter_menu(msg: Message, state: FSMContext):
@@ -239,12 +317,25 @@ async def _show_filter_menu(msg: Message, state: FSMContext):
     cat_id   = data.get("cat_id", "")
     sub_path = data.get("sub_path", "")
 
-    # Лениво (один раз) подтягиваем реальные фильтры этой категории ss.lv.
-    # Лениво (один раз) подтягиваем реальные фильтры категории/листа ss.lv.
+    # Лениво (один раз) подтягиваем РЕАЛЬНЫЕ фильтры ss.lv — уже локализованные
+    # (значения с /lv/), поэтому новые варианты (топливо/цвет) переводятся сами.
+    #  • легковые (марочный флоу) → форма конкретной марки/модели …/sell/;
+    #  • остальные категории      → лист по sub_path.
+    # Если скрейп не удался — cf=[] и ниже сработает hardcoded-фолбэк.
     if data.get("cat_filters") is None:
         cf = []
-        if sub_path.startswith("/"):
-            cf = await p.get_category_filters("https://www.ss.lv" + sub_path)
+        target = None
+        if data.get("brand_slug"):
+            t_cat  = data.get("transport_cat", "cars")
+            target = p.build_listing_url(data["brand_slug"], data.get("model_slug"), category=t_cat)
+        elif sub_path.startswith("/"):
+            target = "https://www.ss.lv" + sub_path
+        if target:
+            try:  # таймаут, чтобы медленный ss.lv не подвешивал меню
+                cf = await asyncio.wait_for(p.get_category_filters(target, lang), timeout=12)
+            except Exception as e:
+                log.warning("get_category_filters timeout/err: %s", e)
+                cf = []
         await state.update_data(cat_filters=cf)
         data["cat_filters"] = cf
     cat_filters = data.get("cat_filters") or []
@@ -273,14 +364,16 @@ async def _show_filter_menu(msg: Message, state: FSMContext):
         # Диапазоны (цена/год/пробег/объём) — удобные пресеты из hardcoded.
         for f in fc.get_filters(cat_id, sub_path):
             if f.get("type") == "range" and _range_applies(f["id"]):
-                kb.button(text=f["label"], callback_data=f"set:{f['id']}")
+                kb.button(text=i18n.ui(f["label"], lang), callback_data=f"set:{f['id']}")
         # Селекты — реальные фильтры ss.lv (Консоль, КПП, Кузов, Цвет…).
         for i, f in enumerate(cat_filters):
-            kb.button(text=f"🔽 {f['label']}", callback_data=f"catf:{i}")
+            kb.button(text=f"🔽 {i18n.filter_label(f['label'], lang)}", callback_data=f"catf:{i}")
         kb.button(text=t(lang, "keyword"), callback_data="set:keyword")
     else:
         for f in fc.get_filters(cat_id, sub_path):
-            kb.button(text=f["label"], callback_data=f"set:{f['id']}")
+            kb.button(text=i18n.ui(f["label"], lang), callback_data=f"set:{f['id']}")
+    # Гео (регион/район/радиус) задаётся один раз в «📍 Моё место» и применяется
+    # ко всем фильтрам — в мастере фильтра его больше нет.
     kb.adjust(2)
     kb.row(InlineKeyboardButton(text=t(lang,"reset_all"),   callback_data="reset_filters"))
     kb.row(
@@ -292,8 +385,8 @@ async def _show_filter_menu(msg: Message, state: FSMContext):
     interval = data.get("check_interval", cat_mod.DEFAULT_INTERVAL)
     text = (
         f"<b>{' › '.join(parts)}</b>\n\n"
-        f"{_filter_summary(data)}\n"
-        f"⏱ {t(lang,'interval_label')}: <b>{_interval_label(interval)}</b>\n\n"
+        f"{_filter_summary(data, lang)}\n"
+        f"⏱ {t(lang,'interval_label')}: <b>{_interval_label(interval, lang)}</b>\n\n"
         + t(lang, "filters_title")
     )
     await _edit(msg, text, reply_markup=kb.as_markup(), parse_mode="HTML")
@@ -311,6 +404,7 @@ async def on_menu_button(msg: Message, state: FSMContext):
     elif action == "stats":  await cmd_stats(msg)
     elif action == "location": await cmd_location(msg, state)
     elif action == "lang":   await cmd_lang(msg, state)
+    elif action == "diag":   await cmd_diag(msg)
 
 
 # ─────────────────────────────────────────────
@@ -321,7 +415,7 @@ async def _show_lang_picker(msg: Message, edit: bool = False):
     for code, label in i18n.LANGS.items():
         kb.button(text=label, callback_data=f"setlang:{code}")
     kb.adjust(1)
-    txt = "🌐 Izvēlies / Выбери / Choose:"
+    txt = "🌐 Izvēlies valodu / Выбери язык:"
     if edit: await _edit(msg, txt, reply_markup=kb.as_markup())
     else:    await msg.answer(txt, reply_markup=kb.as_markup())
 
@@ -331,23 +425,37 @@ async def cmd_lang(msg: Message, state: FSMContext):
     await state.clear()
     await _show_lang_picker(msg)
     await state.set_state(SetLang.picking)
+    log.info("LANG cmd_lang: picker shown, state=%s", await state.get_state())
 
 
-@router.callback_query(SetLang.picking, F.data.startswith("setlang:"))
+# Без привязки к состоянию: кнопки setlang приходят только из языкового меню,
+# поэтому меняем язык в ЛЮБОМ состоянии — это исключает «зависшую» кнопку.
+@router.callback_query(F.data.startswith("setlang:"))
 async def on_lang_pick(cb: CallbackQuery, state: FSMContext):
     lang = cb.data.split(":", 1)[1]
+    if lang not in ("ru", "lv"):   # интерфейс только ru/lv
+        lang = "ru"
+    log.info("LANG on_lang_pick: data=%r -> lang=%s", cb.data, lang)
     await db.set_user_lang(cb.from_user.id, lang)
     user = await db.get_user(cb.from_user.id)
     loc  = t(lang, "loc_not_set")
     if user and user.get("location_name"):
         loc = f"📍 {user['location_name']}"
-    await cb.message.edit_text(
-        t(lang, "lang_set") + "\n\n" + t(lang, "start", loc=loc),
-        parse_mode="HTML",
-    )
-    await cb.message.answer("⬇️", reply_markup=main_kb(lang))
+    # edit_text может упасть («message is not modified» и т.п.) — это не должно
+    # оставлять кнопку «висящей»: state.clear() и cb.answer() ниже сработают всегда.
+    try:
+        await cb.message.edit_text(
+            t(lang, "lang_set") + "\n\n" + t(lang, "start", loc=loc),
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    try:
+        await cb.message.answer("⬇️", reply_markup=main_kb(lang))
+    except Exception:
+        pass
     await state.clear()
-    await cb.answer()
+    await cb.answer(t(lang, "lang_set").replace("<b>", "").replace("</b>", ""))
 
 
 # ─────────────────────────────────────────────
@@ -359,6 +467,15 @@ async def cmd_start(msg: Message, state: FSMContext):
     await db.upsert_user(msg.from_user.id, msg.from_user.username)
     user = await db.get_user(msg.from_user.id)
     lang = (user or {}).get("lang")
+    if lang not in ("ru", "lv"):   # легаси en / не выбран → пусть выберет ru/lv
+        lang = None
+
+    # Меню команд «/» не используем (есть нижние кнопки). Чистим per-chat
+    # команды, если остались от старой версии — иначе меню «двоилось».
+    try:
+        await msg.bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=msg.from_user.id))
+    except Exception:
+        pass
 
     if not lang:
         await _show_lang_picker(msg)
@@ -367,24 +484,24 @@ async def cmd_start(msg: Message, state: FSMContext):
 
     loc = f"📍 {user['location_name']}" if user and user.get("location_name") else t(lang, "loc_not_set")
 
-    # Inline-кнопки в самом сообщении
+    # Inline-кнопки в самом сообщении (lang здесь уже строго ru/lv)
     kb = InlineKeyboardBuilder()
-    kb.button(text="➕ " + {"ru":"Добавить фильтр","lv":"Pievienot filtru","en":"Add filter"}.get(lang,"Add filter"),
+    kb.button(text="➕ " + {"ru":"Добавить фильтр","lv":"Pievienot filtru"}.get(lang,"Pievienot filtru"),
               callback_data="menu:add")
-    kb.button(text="📋 " + {"ru":"Мои фильтры","lv":"Mani filtri","en":"My filters"}.get(lang,"My filters"),
+    kb.button(text="📋 " + {"ru":"Мои фильтры","lv":"Mani filtri"}.get(lang,"Mani filtri"),
               callback_data="menu:list")
-    kb.button(text="📊 " + {"ru":"Статистика","lv":"Statistika","en":"Statistics"}.get(lang,"Statistics"),
+    kb.button(text="📊 " + {"ru":"Статистика","lv":"Statistika"}.get(lang,"Statistika"),
               callback_data="menu:stats")
-    kb.button(text="📍 " + {"ru":"Местоположение","lv":"Atrašanās vieta","en":"Location"}.get(lang,"Location"),
+    kb.button(text="📍 " + {"ru":"Местоположение","lv":"Atrašanās vieta"}.get(lang,"Atrašanās vieta"),
               callback_data="menu:location")
-    kb.button(text="🌐 " + {"ru":"Язык","lv":"Valoda","en":"Language"}.get(lang,"Language"),
-              callback_data="menu:lang")
-    kb.adjust(1, 2, 2)
+    kb.button(text="🌐 LV/RU", callback_data="menu:lang")
+    kb.button(text="🩺 " + {"ru":"Диагностика","lv":"Diagnostika"}.get(lang,"Diagnostika"),
+              callback_data="menu:diag")
+    kb.adjust(1, 2, 2, 1)
 
     greeting = {
         "ru": "👋 <b>ss.lv Monitor</b>\nМониторю любые объявления на ss.lv.\n\n" + loc,
         "lv": "👋 <b>ss.lv Monitor</b>\nUzraugu jebkādus sludinājumus.\n\n" + loc,
-        "en": "👋 <b>ss.lv Monitor</b>\nMonitoring any listings on ss.lv.\n\n" + loc,
     }.get(lang, loc)
 
     # Сначала постоянная клавиатура внизу
@@ -407,10 +524,11 @@ async def cmd_cancel(msg: Message, state: FSMContext):
 # /stats
 # ─────────────────────────────────────────────
 @router.message(Command("stats"))
-async def cmd_stats(msg: Message):
+async def cmd_stats(msg: Message, uid: int | None = None):
     import time
-    lang    = await _lang(msg.from_user.id)
-    filters = await db.list_filters(msg.from_user.id)
+    uid     = uid or msg.from_user.id
+    lang    = await _lang(uid)
+    filters = await db.list_filters(uid)
     if not filters:
         await msg.answer(t(lang, "stats_empty"))
         return
@@ -423,7 +541,7 @@ async def cmd_stats(msg: Message):
         cat   = i18n.cat_label(f.get("category",""), lang)
         sent  = f.get("total_sent") or 0
         last  = f.get("last_sent_at") or "—"
-        iv    = _interval_label(f.get("check_interval") or 300)
+        iv    = _interval_label(f.get("check_interval") or 300, lang)
         lc    = f.get("last_checked_at") or 0
         ago   = int((now - lc) / 60) if lc else None
         head  = f"<b>#{f['id']}</b> {cat}"
@@ -446,153 +564,225 @@ async def on_inline_menu(cb: CallbackQuery, state: FSMContext):
     action = cb.data.split(":", 1)[1]
     await cb.answer()
     if action == "add":
-        await cmd_add(cb.message, state)
+        await cmd_add(cb.message, state, uid=cb.from_user.id)
     elif action == "list":
-        await cmd_list(cb.message)
+        await cmd_list(cb.message, uid=cb.from_user.id)
     elif action == "stats":
-        await cmd_stats(cb.message)
+        await cmd_stats(cb.message, uid=cb.from_user.id)
     elif action == "location":
         lang = await _lang(cb.from_user.id)
+        await state.clear()
         await state.update_data(_lang=lang)
-        await _show_city_menu(cb.message, state, page=0, edit=False, lang=lang)
+        await _show_place_menu(cb.message, state, edit=False)
         await state.set_state(SetLocation.waiting)
     elif action == "lang":
         await _show_lang_picker(cb.message, edit=False)
         await state.set_state(SetLang.picking)
+        log.info("LANG inline: picker shown, state=%s", await state.get_state())
+    elif action == "diag":
+        await cmd_diag(cb.message, uid=cb.from_user.id)
 
 # ─────────────────────────────────────────────
-# /location — город кнопками
+# «Моё место» — геолокация ИЛИ город→район (одна гео-настройка на пользователя)
 # ─────────────────────────────────────────────
 @router.message(Command("location"))
 async def cmd_location(msg: Message, state: FSMContext):
     lang = await _lang(msg.from_user.id)
     await state.clear()
     await state.update_data(_lang=lang)
-    await _show_city_menu(msg, state, page=0, edit=False, lang=lang)
+    await _show_place_menu(msg, state, edit=False)
     await state.set_state(SetLocation.waiting)
 
 
-async def _show_city_menu(msg, state, page=0, edit=True, lang="ru"):
-    cities = geo.CITY_BUTTONS
-    total  = max(1, (len(cities) - 1) // CITIES_PER_PAGE + 1)
-    chunk  = cities[page * CITIES_PER_PAGE: (page + 1) * CITIES_PER_PAGE]
+async def _show_place_menu(msg, state, edit=True):
+    lang = (await state.get_data()).get("_lang","ru")
     kb = InlineKeyboardBuilder()
-    for c in chunk:
-        kb.button(text=c, callback_data=f"city:{c}")
-    kb.adjust(3)
-    nav = []
-    if page > 0:   nav.append(InlineKeyboardButton(text="◀", callback_data=f"cpage:{page-1}"))
-    nav.append(InlineKeyboardButton(text=f"{page+1}/{total}", callback_data="noop"))
-    if page < total-1: nav.append(InlineKeyboardButton(text="▶", callback_data=f"cpage:{page+1}"))
-    if nav: kb.row(*nav)
-    kb.row(InlineKeyboardButton(text=t(lang,"city_gps_btn"),  callback_data="city_gps"))
-    kb.row(InlineKeyboardButton(text=t(lang,"city_type_btn"), callback_data="city_type"))
-    kb.row(InlineKeyboardButton(text=t(lang,"cancel"),        callback_data="cancel"))
-    text = f"📍 <b>{t(lang,'city_page_title')}</b>\n<i>(стр. {page+1}/{total})</i>"
-    if edit: await _edit(msg, text, reply_markup=kb.as_markup(), parse_mode="HTML")
-    else:    await msg.answer(text, reply_markup=kb.as_markup(), parse_mode="HTML")
+    kb.button(text=t(lang,"place_gps"),    callback_data="loc_gps")
+    kb.button(text=t(lang,"place_cities"), callback_data="loc_cities")
+    kb.adjust(1)
+    kb.row(InlineKeyboardButton(text=t(lang,"cancel"), callback_data="cancel"))
+    if edit: await _edit(msg, t(lang,"place_title"), reply_markup=kb.as_markup(), parse_mode="HTML")
+    else:    await msg.answer(t(lang,"place_title"), reply_markup=kb.as_markup(), parse_mode="HTML")
 
 
-@router.callback_query(SetLocation.waiting, F.data.startswith("cpage:"))
-async def city_page_cb(cb: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    await _show_city_menu(cb.message, state, int(cb.data.split(":",1)[1]), True, data.get("_lang","ru"))
+@router.callback_query(SetLocation.waiting, F.data == "loc_back")
+async def loc_back(cb: CallbackQuery, state: FSMContext):
+    await _show_place_menu(cb.message, state, edit=True)
     await cb.answer()
 
 
-@router.callback_query(SetLocation.waiting, F.data.startswith("city:"))
-async def on_city_pick(cb: CallbackQuery, state: FSMContext):
-    name  = cb.data.split(":",1)[1]
-    data  = await state.get_data()
-    lang  = data.get("_lang","ru")
-    coords = geo.city_coords(name)
-    if coords:
-        lat, lon = coords
-        await db.set_user_location(cb.from_user.id, lat, lon, name)
-        await cb.message.edit_text(t(lang,"location_saved",name=name), parse_mode="HTML")
-        await cb.message.answer("⬇️", reply_markup=main_kb(lang))
-        await state.clear()
-    else:
-        await cb.answer("?", show_alert=True)
-
-
-@router.callback_query(SetLocation.waiting, F.data == "city_gps")
-async def city_gps_btn(cb: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    lang = data.get("_lang","ru")
-    kb   = ReplyKeyboardMarkup(
+# ─── Вариант 1: моя геолокация (GPS) → радиус ───────────────────
+@router.callback_query(SetLocation.waiting, F.data == "loc_gps")
+async def loc_gps(cb: CallbackQuery, state: FSMContext):
+    lang = (await state.get_data()).get("_lang","ru")
+    kb = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text=t(lang,"city_gps_btn"), request_location=True)],
                   [KeyboardButton(text=t(lang,"cancel"))]],
-        resize_keyboard=True, one_time_keyboard=True,
-    )
-    await cb.message.answer("📍", reply_markup=kb)
+        resize_keyboard=True, one_time_keyboard=True)
+    await cb.message.answer(t(lang,"place_gps_ask"), reply_markup=kb)
     await cb.answer()
-
-
-@router.callback_query(SetLocation.waiting, F.data == "city_type")
-async def city_type_btn(cb: CallbackQuery, state: FSMContext):
-    await cb.message.edit_text("✏️ Напиши название города:")
-    await state.set_state(SetLocation.city_page)
-    await cb.answer()
-
-
-@router.message(SetLocation.city_page, F.text)
-async def on_city_text_input(msg: Message, state: FSMContext):
-    data = await state.get_data()
-    lang = data.get("_lang","ru")
-    text = (msg.text or "").strip()
-    if text.lower() in ("отмена","cancel","atcelt"):
-        await state.clear()
-        await msg.answer(t(lang,"cancelled"), reply_markup=main_kb(lang))
-        return
-    coords = geo.city_coords(text)
-    if coords:
-        lat, lon = coords
-        await db.set_user_location(msg.from_user.id, lat, lon, text.title())
-        await state.clear()
-        await msg.answer(t(lang,"location_saved",name=text.title()),
-                         parse_mode="HTML", reply_markup=main_kb(lang))
-    else:
-        await msg.answer("⏳…")
-        result = await geo.geocode_nominatim(text)
-        if result:
-            lat, lon, display = result
-            await db.set_user_location(msg.from_user.id, lat, lon, text.title())
-            await state.clear()
-            await msg.answer(t(lang,"location_saved",name=display[:60]),
-                             parse_mode="HTML", reply_markup=main_kb(lang))
-        else:
-            await msg.answer(t(lang,"location_notfound",name=text))
 
 
 @router.message(SetLocation.waiting, F.location)
 async def on_gps(msg: Message, state: FSMContext):
-    data = await state.get_data()
-    lang = data.get("_lang","ru")
+    lang = (await state.get_data()).get("_lang","ru")
     lat, lon = msg.location.latitude, msg.location.longitude
     name = geo.nearest_city(lat, lon) or f"{lat:.4f}, {lon:.4f}"
-    await db.set_user_location(msg.from_user.id, lat, lon, name)
+    await state.update_data(gps_lat=lat, gps_lon=lon, gps_name=name)
+    km_u = "km" if lang == "lv" else "км"
+    kb = InlineKeyboardBuilder()
+    kb.button(text=t(lang,"any_region"), callback_data="lrad:0")   # без ограничения
+    for km in (5, 10, 20, 50, 100):
+        kb.button(text=f"{km} {km_u}", callback_data=f"lrad:{km}")
+    kb.adjust(3)
+    await msg.answer(t(lang,"place_radius_ask", name=name),
+                     reply_markup=kb.as_markup(), parse_mode="HTML")
+
+
+@router.callback_query(SetLocation.waiting, F.data.startswith("lrad:"))
+async def loc_radius(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data(); lang = data.get("_lang","ru")
+    km   = int(cb.data.split(":",1)[1]) or None
+    lat, lon, name = data.get("gps_lat"), data.get("gps_lon"), data.get("gps_name","GPS")
+    await db.set_user_geo(cb.from_user.id, "gps", lat, lon, name, radius=km)
     await state.clear()
-    await msg.answer(t(lang,"location_saved",name=name),
-                     parse_mode="HTML", reply_markup=main_kb(lang))
+    km_u = "km" if lang == "lv" else "км"
+    suffix = f" · ≤{km} {km_u}" if km else ""
+    await cb.message.edit_text(t(lang,"location_saved", name=_esc(name) + suffix), parse_mode="HTML")
+    await cb.message.answer("⬇️", reply_markup=main_kb(lang))
+    await cb.answer("✅")
+
+
+# ─── Вариант 2: список городов/регионов → район ─────────────────
+@router.callback_query(SetLocation.waiting, F.data == "loc_cities")
+async def loc_cities(cb: CallbackQuery, state: FSMContext):
+    lang = (await state.get_data()).get("_lang","ru")
+    await cb.bot.send_chat_action(cb.from_user.id, "typing")
+    # Матч в мониторе идёт по полю «Местонахождение» карточки, а оно ВСЕГДА
+    # русское → значение региона храним по-русски (names_ru), а на кнопках
+    # показываем на языке интерфейса (names_show). Порядок опций одинаков на
+    # /ru/ и /lv/ страницах, поэтому зипуем по индексу.
+    names_ru, names_show = [], []
+    try:
+        ru = await asyncio.wait_for(p.get_subcategories("/ru/real-estate/flats/", "ru"), timeout=15)
+        names_ru = [r["name"] for r in ru]
+        if lang == "ru":
+            names_show = list(names_ru)
+        else:
+            loc = await asyncio.wait_for(p.get_subcategories("/ru/real-estate/flats/", lang), timeout=15)
+            show = [r["name"] for r in loc]
+            names_show = show if len(show) == len(names_ru) else list(names_ru)
+    except Exception as e:
+        log.warning("loc regions: %s", e)
+    if not names_ru:                              # фолбэк при сбое скрейпа (русские значения)
+        names_ru   = [n.title() for n in geo.CITY_RU2LV.keys()]
+        names_show = [geo.localize_city(n, lang) for n in names_ru]
+    await state.update_data(loc_regions=names_ru, loc_regions_show=names_show)
+    kb = InlineKeyboardBuilder()
+    _grid(kb, [InlineKeyboardButton(text=s, callback_data=f"lreg:{i}")
+               for i, s in enumerate(names_show)], wide=2)
+    kb.row(InlineKeyboardButton(text=t(lang,"back"), callback_data="loc_back"))
+    await _edit(cb.message, t(lang,"city_page_title"), reply_markup=kb.as_markup(), parse_mode="HTML")
+    await cb.answer()
+
+
+@router.callback_query(SetLocation.waiting, F.data.startswith("lreg:"))
+async def loc_region_pick(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data(); lang = data.get("_lang","ru")
+    regs = data.get("loc_regions", [])                 # русские значения (для матча)
+    show = data.get("loc_regions_show", regs)
+    try: idx = int(cb.data.split(":",1)[1])
+    except ValueError: idx = -1
+    if not (0 <= idx < len(regs)):
+        await cb.answer(); return
+    region      = regs[idx]                             # русское значение
+    region_show = show[idx] if idx < len(show) else region
+    await state.update_data(loc_region=region, loc_region_show=region_show)
+    await cb.bot.send_chat_action(cb.from_user.id, "typing")
+    # Районы: русские значения (для матча) + локализованные подписи, зип по индексу.
+    dist_ru, dist_show = [], []
+    try:
+        dist_ru = await asyncio.wait_for(p.get_region_districts(region, "ru"), timeout=15)
+        if lang == "ru":
+            dist_show = list(dist_ru)
+        else:
+            d2 = await asyncio.wait_for(p.get_region_districts(region_show, lang), timeout=15)
+            dist_show = d2 if len(d2) == len(dist_ru) else list(dist_ru)
+    except Exception as e:
+        log.warning("loc districts: %s", e)
+    await state.update_data(loc_districts=dist_ru, loc_districts_show=dist_show)
+    kb = InlineKeyboardBuilder()
+    btns = [InlineKeyboardButton(text=t(lang,"any_district"), callback_data="ldist:_all_")]
+    btns += [InlineKeyboardButton(text=s, callback_data=f"ldist:{i}") for i, s in enumerate(dist_show)]
+    _grid(kb, btns, wide=2)
+    kb.row(InlineKeyboardButton(text=t(lang,"back"), callback_data="loc_cities"))
+    await _edit(cb.message, t(lang,"district_title", region=_esc(region_show)),
+                reply_markup=kb.as_markup(), parse_mode="HTML")
+    await cb.answer()
+
+
+@router.callback_query(SetLocation.waiting, F.data.startswith("ldist:"))
+async def loc_district_pick(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data(); lang = data.get("_lang","ru")
+    region      = data.get("loc_region", "")           # русское значение
+    region_show = data.get("loc_region_show", region)
+    key = cb.data.split(":",1)[1]
+    district = district_show = None
+    if key != "_all_":
+        dl  = data.get("loc_districts", [])             # русские значения
+        dls = data.get("loc_districts_show", dl)
+        try: idx = int(key)
+        except ValueError: idx = -1
+        if 0 <= idx < len(dl):
+            district      = dl[idx]
+            district_show = dls[idx] if idx < len(dls) else dl[idx]
+    name = region_show + (f", {district_show}" if district_show else "")   # для показа
+    # Точка отсчёта для расстояния: геокодим район/город по РУССКОМУ имени
+    # (один запрос), фолбэк — координаты города из таблицы.
+    lat = lon = None
+    try:
+        g = await asyncio.wait_for(geo.geocode_nominatim(f"{district}, {region}" if district else region),
+                                   timeout=12)
+        if g: lat, lon = g[0], g[1]
+    except Exception:
+        pass
+    if lat is None:
+        c = geo.city_coords(region) or geo.city_coords(region.split()[0] if region else "")
+        if c: lat, lon = c
+    # region/district храним ПО-РУССКИ — поле «Местонахождение» карточки русское.
+    await db.set_user_geo(cb.from_user.id, "area", lat, lon, name, region=region, district=district)
+    await state.clear()
+    await cb.message.edit_text(t(lang,"location_saved", name=_esc(name)), parse_mode="HTML")
+    await cb.message.answer("⬇️", reply_markup=main_kb(lang))
+    await cb.answer("✅")
+
+
+@router.message(SetLocation.waiting, F.text)
+async def loc_cancel_text(msg: Message, state: FSMContext):
+    # Текст в состоянии выбора места — это «❌ Отмена» с GPS-клавиатуры.
+    lang = (await state.get_data()).get("_lang","ru")
+    await state.clear()
+    await msg.answer(t(lang,"cancelled"), reply_markup=main_kb(lang))
 
 
 # ─────────────────────────────────────────────
 # /add → категории
 # ─────────────────────────────────────────────
 @router.message(Command("add"))
-async def cmd_add(msg: Message, state: FSMContext):
-    lang = await _lang(msg.from_user.id)
-    cnt  = await db.count_filters(msg.from_user.id)
+async def cmd_add(msg: Message, state: FSMContext, uid: int | None = None):
+    # uid передаётся, когда команда вызвана из inline-кнопки (там msg.from_user —
+    # это бот, а не пользователь). По умолчанию берём отправителя сообщения.
+    uid  = uid or msg.from_user.id
+    lang = await _lang(uid)
+    cnt  = await db.count_filters(uid)
     if cnt >= config.MAX_FILTERS_PER_USER:
         await msg.answer(t(lang,"max_filters",max=config.MAX_FILTERS_PER_USER))
         return
     await state.clear()
     await state.update_data(_lang=lang)
     kb = InlineKeyboardBuilder()
-    for c in cat_mod.TOP_CATEGORIES:
-        kb.button(text=i18n.cat_label(c["id"],lang), callback_data=f"topcat:{c['id']}")
-    kb.adjust(2)
+    _grid(kb, [InlineKeyboardButton(text=c["label"], callback_data=f"topcat:{c['id']}")
+               for c in await _top_cats(lang)], wide=2)
     kb.row(InlineKeyboardButton(text=t(lang,"cancel"), callback_data="cancel"))
     await msg.answer(t(lang,"what_monitor"), reply_markup=kb.as_markup())
     await state.set_state(AddFilter.top_cat)
@@ -601,11 +791,11 @@ async def cmd_add(msg: Message, state: FSMContext):
 @router.callback_query(AddFilter.top_cat, F.data.startswith("topcat:"))
 async def on_top_cat(cb: CallbackQuery, state: FSMContext):
     cat_id = cb.data.split(":",1)[1]
-    cat    = next((c for c in cat_mod.TOP_CATEGORIES if c["id"]==cat_id), None)
-    if not cat: return
     data   = await state.get_data()
     lang   = data.get("_lang","ru")
-    cat_l  = i18n.cat_label(cat_id, lang)
+    cat    = next((c for c in await _top_cats(lang) if c["id"]==cat_id), None)
+    if not cat: return
+    cat_l  = cat["label"]
     await state.update_data(
         cat_id=cat_id, cat_label=cat_l, cat_type=cat["type"], cat_path=cat["path"],
         price_min=None, price_max=None, year_min=None, year_max=None,
@@ -617,7 +807,13 @@ async def on_top_cat(cb: CallbackQuery, state: FSMContext):
     )
     await cb.message.edit_text(f"{cat_l}\n⏳…")
     await cb.bot.send_chat_action(cb.from_user.id, "typing")
-    subs = await cache.subcats(cat["path"], p)
+    # имена приходят уже на языке пользователя (ss.lv отдаёт нативно).
+    # Таймаут, чтобы медленный ss.lv не подвешивал добавление фильтра.
+    try:
+        subs = await asyncio.wait_for(cache.subcats(cat["path"], p, lang), timeout=20)
+    except Exception as e:
+        log.warning("subcats timeout %s: %s", cat["path"], e)
+        subs = []
     if not subs:
         raw  = cat_mod.FALLBACK_SUBS.get(cat_id, [])
         subs = [{"name": i18n.translate_subcat(n,lang),
@@ -626,18 +822,17 @@ async def on_top_cat(cb: CallbackQuery, state: FSMContext):
     else:
         for s in subs:
             if "url" not in s: s["url"] = cat["path"] + s["slug"] + "/"
-            s["name"] = i18n.translate_subcat(s["name"], lang)
 
     # «Редкие авто» (ретро/спорт/тюнинг/эксклюзив/электро) — спец-разделы
     # легковых, которых нет в одноуровневой навигации /ru/transport/.
     if cat_id == "transport":
         have = {s.get("url") for s in subs}
-        for name, url in cat_mod.CARS_SPECIAL:
+        for names, url in cat_mod.CARS_SPECIAL:
             if url not in have:
-                subs.append({"name": name,
+                subs.append({"name": names.get(lang, names["ru"]),
                              "slug": url.rstrip("/").rsplit("/", 1)[-1],
                              "url": url})
-    await state.update_data(subs=subs, nav_stack=[], nav_label=None)
+    await state.update_data(subs=subs, nav_stack=[], nav_label=None, here_url=None)
     await _show_subs(cb.message, state, 0)
     await state.set_state(AddFilter.sub_cat)
     await cb.answer()
@@ -648,19 +843,33 @@ async def _show_subs(msg, state, page=0):
     subs  = data.get("subs",[])
     label = data.get("nav_label") or data.get("cat_label","")
     lang  = data.get("_lang","ru")
-    total = max(1,(len(subs)-1)//SUBS_PER_PAGE+1)
-    chunk = subs[page*SUBS_PER_PAGE:(page+1)*SUBS_PER_PAGE]
+    # Колонки и размер страницы — под длину названий: длинные (как латышские
+    # «Brilles, siksnas…») по 1 в ряд на всю ширину (не обрезаются), короткие
+    # (как «Собаки», «Кошки») по 2. Меню всегда помещается на экран.
+    m    = max((len(s.get("name","")) for s in subs), default=0)
+    cols = 1 if m > 24 else 2
+    per  = 5 if cols == 1 else 8
+    total = max(1,(len(subs)-1)//per+1)
+    page  = max(0, min(page, total-1))
+    chunk = subs[page*per:(page+1)*per]
     kb = InlineKeyboardBuilder()
-    for i, s in enumerate(chunk):
-        kb.button(text=s.get("name",""), callback_data=f"sub:{page*SUBS_PER_PAGE+i}")
-    kb.adjust(1)
+    # Если мы внутри раздела (углубились) — даём мониторить его ЦЕЛИКОМ или искать
+    # по слову («весь Samsung», как «любая модель» у авто). Одной строкой.
+    here = data.get("here_url")
+    if here and here.startswith("/"):
+        kb.row(InlineKeyboardButton(text=t(lang,"monitor_all"), callback_data="subhere"),
+               InlineKeyboardButton(text=t(lang,"keyword"),     callback_data="kwhere"))
+    sub_btns = [InlineKeyboardButton(text=s.get("name",""), callback_data=f"sub:{page*per+i}")
+                for i, s in enumerate(chunk)]
+    for j in range(0, len(sub_btns), cols):
+        kb.row(*sub_btns[j:j+cols])
     nav = []
     if page > 0:   nav.append(InlineKeyboardButton(text="◀", callback_data=f"subp:{page-1}"))
     nav.append(InlineKeyboardButton(text=f"{page+1}/{total}", callback_data="noop"))
     if page < total-1: nav.append(InlineKeyboardButton(text="▶", callback_data=f"subp:{page+1}"))
     if nav: kb.row(*nav)
-    kb.row(InlineKeyboardButton(text=t(lang,"back"),   callback_data="back_top"))
-    kb.row(InlineKeyboardButton(text=t(lang,"cancel"), callback_data="cancel"))
+    kb.row(InlineKeyboardButton(text=t(lang,"back"),   callback_data="back_top"),
+           InlineKeyboardButton(text=t(lang,"cancel"), callback_data="cancel"))
     await _edit(msg, f"<b>{label}</b>: {t(lang,'choose_subcat')} <i>({page+1}/{total})</i>",
                 reply_markup=kb.as_markup(), parse_mode="HTML")
 
@@ -681,17 +890,51 @@ async def back_top(cb: CallbackQuery, state: FSMContext):
     if stack:
         prev = stack.pop()
         await state.update_data(nav_stack=stack, subs=prev["subs"],
-                                nav_label=prev["label"])
+                                nav_label=prev["label"], here_url=prev.get("url"))
         await _show_subs(cb.message, state, 0)
         await cb.answer(); return
 
     kb   = InlineKeyboardBuilder()
-    for c in cat_mod.TOP_CATEGORIES:
-        kb.button(text=i18n.cat_label(c["id"],lang), callback_data=f"topcat:{c['id']}")
-    kb.adjust(2)
+    _grid(kb, [InlineKeyboardButton(text=c["label"], callback_data=f"topcat:{c['id']}")
+               for c in await _top_cats(lang)], wide=2)
     kb.row(InlineKeyboardButton(text=t(lang,"cancel"), callback_data="cancel"))
-    await cb.message.edit_text(t(lang,"what_monitor"), reply_markup=kb.as_markup())
+    await _edit(cb.message, t(lang,"what_monitor"), reply_markup=kb.as_markup())
     await state.set_state(AddFilter.top_cat)
+    await cb.answer()
+
+
+@router.callback_query(AddFilter.sub_cat, F.data == "subhere")
+async def on_sub_here(cb: CallbackQuery, state: FSMContext):
+    """«Мониторить весь раздел» — текущий раздел (here_url) как лист, без выбора
+    конкретного подпункта. Например «весь Samsung»."""
+    data = await state.get_data()
+    here = data.get("here_url")
+    if not here:
+        await cb.answer(); return
+    crumb = data.get("nav_label") or ""
+    name  = crumb.split("›")[-1].strip() if crumb else here.rstrip("/").rsplit("/", 1)[-1]
+    await state.update_data(sub_path=here, sub_label=name,
+                            cat_filters=None, cols_sel={}, adopts_sel={})
+    await _show_filter_menu(cb.message, state)
+    await cb.answer()
+
+
+@router.callback_query(AddFilter.sub_cat, F.data == "kwhere")
+async def on_kw_here(cb: CallbackQuery, state: FSMContext):
+    """«Искать по слову» прямо из раздела: текущий раздел + ввод ключевого слова."""
+    data = await state.get_data()
+    lang = data.get("_lang","ru")
+    here = data.get("here_url")
+    if not here:
+        await cb.answer(); return
+    crumb = data.get("nav_label") or ""
+    name  = crumb.split("›")[-1].strip() if crumb else here.rstrip("/").rsplit("/", 1)[-1]
+    await state.update_data(sub_path=here, sub_label=name,
+                            cat_filters=None, cols_sel={}, adopts_sel={})
+    kb = InlineKeyboardBuilder()
+    kb.button(text=t(lang,"back"), callback_data="back_to_filters")
+    await _edit(cb.message, t(lang,"keyword_hint"), reply_markup=kb.as_markup(), parse_mode="HTML")
+    await state.set_state(AddFilter.inp_keyword)
     await cb.answer()
 
 
@@ -713,7 +956,10 @@ async def on_sub(cb: CallbackQuery, state: FSMContext):
         base_url  = cat_mod.RIGA_REALTY_BASE[riga_type]
         await cb.message.edit_text("⏳…")
         await cb.bot.send_chat_action(cb.from_user.id, "typing")
-        dynamic   = await p.get_subcategories(base_url)
+        try:
+            dynamic = await asyncio.wait_for(p.get_subcategories(base_url, lang), timeout=20)
+        except Exception:
+            dynamic = []
         districts = [(d["name"],d["slug"]) for d in dynamic] if dynamic else list(cat_mod.RIGA_DISTRICTS)
         await state.update_data(riga_type=riga_type, riga_districts=districts, sub_path=base_url)
         await _show_riga_districts(cb.message, state, 0)
@@ -722,7 +968,10 @@ async def on_sub(cb: CallbackQuery, state: FSMContext):
         t_cat = cat_mod.TRANSPORT_FULL[sub_url]
         await cb.message.edit_text(f"<b>{sub['name']}</b>\n{t(lang,'loading_brands')}", parse_mode="HTML")
         await cb.bot.send_chat_action(cb.from_user.id, "typing")
-        brands_list = await p.get_brands(t_cat)
+        try:
+            brands_list = await asyncio.wait_for(p.get_brands(t_cat, lang), timeout=20)
+        except Exception as e:
+            log.warning("get_brands timeout: %s", e); brands_list = []
         await state.update_data(transport_cat=t_cat, brands=brands_list)
         await _show_brands(cb.message, state, 0)
         await state.set_state(AddFilter.brand)
@@ -732,14 +981,21 @@ async def on_sub(cb: CallbackQuery, state: FSMContext):
         # (сами объявления) → переходим к меню фильтров.
         await cb.message.edit_text(f"<b>{sub['name']}</b>\n⏳…", parse_mode="HTML")
         await cb.bot.send_chat_action(cb.from_user.id, "typing")
-        children = await p.get_subcategories(sub_url) if sub_url.startswith("/") else []
+        children = []
+        if sub_url.startswith("/"):
+            try:
+                children = await asyncio.wait_for(p.get_subcategories(sub_url, lang), timeout=20)
+            except Exception as e:
+                log.warning("drill timeout %s: %s", sub_url, e)
         if children:
             stack = data.get("nav_stack", [])
-            stack.append({"subs": subs, "label": data.get("nav_label") or data.get("cat_label","")})
-            for s in children:
-                s["name"] = i18n.translate_subcat(s["name"], lang)
+            stack.append({"subs": subs, "label": data.get("nav_label") or data.get("cat_label",""),
+                          "url": data.get("here_url")})
+            # имена детей уже на языке пользователя (ss.lv отдаёт нативно)
             crumb = (data.get("nav_label") or data.get("cat_label","")) + " › " + sub["name"]
-            await state.update_data(nav_stack=stack, subs=children, nav_label=crumb)
+            # here_url = текущий раздел (его можно мониторить целиком — «весь Samsung»)
+            await state.update_data(nav_stack=stack, subs=children, nav_label=crumb,
+                                    here_url=sub_url)
             await _show_subs(cb.message, state, 0)
         else:
             await _show_filter_menu(cb.message, state)
@@ -754,13 +1010,14 @@ async def _show_riga_districts(msg, state, page=0):
     lang  = data.get("_lang","ru")
     dist  = data.get("riga_districts",[])
     rtype = data.get("riga_type","flats")
-    title = "🏘 Квартиры" if rtype=="flats" else "🏠 Дома"
+    _rtitle = {"flats": {"ru":"🏘 Квартиры","lv":"🏘 Dzīvokļi","en":"🏘 Apartments"},
+               "houses":{"ru":"🏠 Дома","lv":"🏠 Mājas","en":"🏠 Houses"}}
+    title = _rtitle.get(rtype, _rtitle["flats"]).get(lang, _rtitle.get(rtype, _rtitle["flats"])["ru"])
     total = max(1,(len(dist)-1)//RIGA_PAGE+1)
     chunk = dist[page*RIGA_PAGE:(page+1)*RIGA_PAGE]
     kb    = InlineKeyboardBuilder()
-    for name, slug in chunk:
-        kb.button(text=name, callback_data=f"rig:{slug}:{name}")
-    kb.adjust(2)
+    _grid(kb, [InlineKeyboardButton(text=name, callback_data=f"rig:{slug}:{name}")
+               for name, slug in chunk], wide=2)
     nav = []
     if page > 0:   nav.append(InlineKeyboardButton(text="◀", callback_data=f"rigp:{page-1}"))
     nav.append(InlineKeyboardButton(text=f"{page+1}/{total}", callback_data="noop"))
@@ -784,6 +1041,8 @@ async def on_riga_district(cb: CallbackQuery, state: FSMContext):
     _, slug, name = cb.data.split(":",2)
     data = await state.get_data()
     rtype = data.get("riga_type","flats")
+    if slug == "_all_":   # «Вся Рига» — подпись на языке пользователя
+        name = t(data.get("_lang","ru"), "all_riga")
     url   = cat_mod.RIGA_REALTY_BASE[rtype] if slug=="_all_" else cat_mod.RIGA_REALTY_BASE[rtype]+slug+"/"
     await state.update_data(sub_label=name, sub_path=url)
     await _show_filter_menu(cb.message, state)
@@ -806,17 +1065,17 @@ async def _show_brands(msg, state, page=0):
     total = max(1,(len(lst)-1)//br.PAGE_SIZE+1)
     chunk = lst[page*br.PAGE_SIZE:(page+1)*br.PAGE_SIZE]
     kb    = InlineKeyboardBuilder()
-    for item in chunk:
-        kb.button(text=item["name"], callback_data=f"br:{item['slug']}:{item['name']}")
-    kb.adjust(3)
+    _grid(kb, [InlineKeyboardButton(text=item["name"],
+                                    callback_data=f"br:{item['slug']}:{item['name']}")
+               for item in chunk], wide=3)
     nav = []
     if page > 0:   nav.append(InlineKeyboardButton(text="◀", callback_data=f"brp:{page-1}"))
     nav.append(InlineKeyboardButton(text=f"{page+1}/{total}", callback_data="noop"))
     if page < total-1: nav.append(InlineKeyboardButton(text="▶", callback_data=f"brp:{page+1}"))
     if nav: kb.row(*nav)
     kb.row(InlineKeyboardButton(text=t(lang,"input_manual"), callback_data="br:_manual_:"))
-    kb.row(InlineKeyboardButton(text=t(lang,"back"),   callback_data="back_sub_from_brand"))
-    kb.row(InlineKeyboardButton(text=t(lang,"cancel"), callback_data="cancel"))
+    kb.row(InlineKeyboardButton(text=t(lang,"back"),   callback_data="back_sub_from_brand"),
+           InlineKeyboardButton(text=t(lang,"cancel"), callback_data="cancel"))
     await _edit(msg, f"<b>{sub}</b>: {t(lang,'choose_brand')} <i>({page+1}/{total})</i>",
                 reply_markup=kb.as_markup(), parse_mode="HTML")
 
@@ -852,7 +1111,7 @@ async def on_brand(cb: CallbackQuery, state: FSMContext):
     await cb.bot.send_chat_action(cb.from_user.id, "typing")
     models = []
     try:
-        models = await cache.models(slug, data.get("transport_cat","cars"), p)
+        models = await cache.models(slug, data.get("transport_cat","cars"), p, lang)
     except Exception as e:
         log.warning(f"get_models: {e}")
     await state.update_data(models=models)
@@ -868,21 +1127,21 @@ async def _show_model_kb(msg, state, page=0):
     lang   = data.get("_lang","ru")
     PAGE   = 12
     kb     = InlineKeyboardBuilder()
-    kb.button(text=t(lang,"any_model"), callback_data="md:_any_:Любая")
+    kb.row(InlineKeyboardButton(text=t(lang,"any_model"), callback_data="md:_any_:Любая"))
     if models:
         total = max(1,(len(models)-1)//PAGE+1)
         chunk = models[page*PAGE:(page+1)*PAGE]
-        for m in chunk:
-            kb.button(text=m["name"], callback_data=f"md:{m['slug']}:{m['name'][:20]}")
-        kb.adjust(3)
+        _grid(kb, [InlineKeyboardButton(text=m["name"],
+                                        callback_data=f"md:{m['slug']}:{m['name'][:20]}")
+                   for m in chunk], wide=3)
         nav = []
         if page > 0:   nav.append(InlineKeyboardButton(text="◀", callback_data=f"mdp:{page-1}"))
         nav.append(InlineKeyboardButton(text=f"{page+1}/{total}", callback_data="noop"))
         if page < total-1: nav.append(InlineKeyboardButton(text="▶", callback_data=f"mdp:{page+1}"))
         if nav: kb.row(*nav)
     kb.row(InlineKeyboardButton(text=t(lang,"input_manual"), callback_data="md:_manual_:"))
-    kb.row(InlineKeyboardButton(text=t(lang,"back"),   callback_data="back_brands"))
-    kb.row(InlineKeyboardButton(text=t(lang,"cancel"), callback_data="cancel"))
+    kb.row(InlineKeyboardButton(text=t(lang,"back"),   callback_data="back_brands"),
+           InlineKeyboardButton(text=t(lang,"cancel"), callback_data="cancel"))
     status = t(lang,"models_found",n=len(models)) if models else t(lang,"models_failed")
     await _edit(msg, f"<b>{brand}</b>: {t(lang,'choose_model')}\n<i>{status}</i>",
                 reply_markup=kb.as_markup(), parse_mode="HTML")
@@ -935,7 +1194,7 @@ async def on_manual_input(msg: Message, state: FSMContext):
         await msg.bot.send_chat_action(msg.chat.id, "typing")
         models = []
         try:
-            models = await cache.models(slug, data.get("transport_cat","cars"), p)
+            models = await cache.models(slug, data.get("transport_cat","cars"), p, lang)
         except Exception: pass
         await state.update_data(models=models)
         await _show_model_kb(msg, state)
@@ -957,7 +1216,8 @@ async def on_set_filter(cb: CallbackQuery, state: FSMContext):
     if which == "interval":
         kb = InlineKeyboardBuilder()
         for label, sec in cat_mod.INTERVALS:
-            kb.button(text=label, callback_data=f"iv:{sec}")
+            emoji = label.split(" ", 1)[0]
+            kb.button(text=f"{emoji} {_interval_label(sec, lang)}", callback_data=f"iv:{sec}")
         kb.adjust(2)
         kb.row(InlineKeyboardButton(text=t(lang,"back"), callback_data="back_to_filters"))
         await cb.message.edit_text(t(lang,"interval_title"),
@@ -1003,11 +1263,11 @@ async def on_set_filter(cb: CallbackQuery, state: FSMContext):
         options, title = SELECT_MAP[which]
         kb2 = InlineKeyboardBuilder()
         for label, val in options:
-            kb2.button(text=label, callback_data=f"pick:{which}:{val}")
+            kb2.button(text=i18n.ui(label, lang), callback_data=f"pick:{which}:{val}")
         kb2.adjust(2)
         kb2.row(InlineKeyboardButton(text=t(lang,"clear"), callback_data=f"clear:{which}"),
                 InlineKeyboardButton(text=t(lang,"back"),  callback_data="back_to_filters"))
-        await cb.message.edit_text(f"<b>{title}</b>:",
+        await cb.message.edit_text(f"<b>{i18n.ui(title, lang)}</b>:",
                                    reply_markup=kb2.as_markup(), parse_mode="HTML")
         await state.set_state(AddFilter.inp_gearbox)
         await cb.answer(); return
@@ -1020,7 +1280,7 @@ async def on_set_filter(cb: CallbackQuery, state: FSMContext):
     if which in RANGE_MAP:
         presets, title, key = RANGE_MAP[which]
         kb2 = _preset_kb(presets, key, lang)
-        await cb.message.edit_text(f"<b>{title}</b>:",
+        await cb.message.edit_text(f"<b>{i18n.ui(title, lang)}</b>:",
                                    reply_markup=kb2.as_markup(), parse_mode="HTML")
         # отдельное состояние, чтобы ручной ввод не попал в цену
         await state.update_data(_rk=key)
@@ -1030,7 +1290,7 @@ async def on_set_filter(cb: CallbackQuery, state: FSMContext):
     if which == "gearbox":
         kb = InlineKeyboardBuilder()
         for label, val in br.GEARBOX_OPTIONS:
-            kb.button(text=label, callback_data=f"pick:gearbox:{val}")
+            kb.button(text=i18n.ui(label, lang), callback_data=f"pick:gearbox:{val}")
         kb.adjust(1)
         kb.row(InlineKeyboardButton(text=t(lang,"clear"), callback_data="clear:gearbox"),
                InlineKeyboardButton(text=t(lang,"back"),  callback_data="back_to_filters"))
@@ -1042,7 +1302,7 @@ async def on_set_filter(cb: CallbackQuery, state: FSMContext):
     if which == "bodytype":
         kb = InlineKeyboardBuilder()
         for label, val in br.BODYTYPE_OPTIONS:
-            kb.button(text=label, callback_data=f"pick:bodytype:{val}")
+            kb.button(text=i18n.ui(label, lang), callback_data=f"pick:bodytype:{val}")
         kb.adjust(2)
         kb.row(InlineKeyboardButton(text=t(lang,"clear"), callback_data="clear:bodytype"),
                InlineKeyboardButton(text=t(lang,"back"),  callback_data="back_to_filters"))
@@ -1073,12 +1333,13 @@ async def on_cat_filter(cb: CallbackQuery, state: FSMContext):
         await cb.answer(); return
     f  = cat_filters[i]
     kb = InlineKeyboardBuilder()
-    for j, opt in enumerate(f["options"]):
+    disp = f.get("options_disp") or f["options"]
+    for j, opt in enumerate(disp):
         kb.button(text=opt, callback_data=f"catpick:{i}:{j}")
     kb.adjust(2)
     kb.row(InlineKeyboardButton(text=t(lang,"clear"), callback_data=f"catclear:{i}"),
            InlineKeyboardButton(text=t(lang,"back"),  callback_data="back_to_filters"))
-    await cb.message.edit_text(f"<b>{f['label']}</b>:",
+    await cb.message.edit_text(f"<b>{i18n.filter_label(f['label'], lang)}</b>:",
                                reply_markup=kb.as_markup(), parse_mode="HTML")
     await cb.answer()
 
@@ -1167,10 +1428,11 @@ async def on_pick_option(cb: CallbackQuery, state: FSMContext):
 # ─── Интервал ─────────────────────────────────────────────────
 @router.callback_query(AddFilter.interval, F.data.startswith("iv:"))
 async def on_interval(cb: CallbackQuery, state: FSMContext):
-    sec = int(cb.data.split(":",1)[1])
+    sec  = int(cb.data.split(":",1)[1])
+    lang = (await state.get_data()).get("_lang","ru")
     await state.update_data(check_interval=sec)
     await _show_filter_menu(cb.message, state)
-    await cb.answer(f"✅ {_interval_label(sec)}")
+    await cb.answer(f"✅ {_interval_label(sec, lang)}")
 
 
 # ─── Очистить ─────────────────────────────────────────────────
@@ -1283,20 +1545,26 @@ async def save_filter(cb: CallbackQuery, state: FSMContext):
         params["cols"] = cols_sel
     if adopts_sel:
         params["adopts"] = adopts_sel
+    # Гео (регион/район/радиус) теперь общее в «Моё место» (на пользователе),
+    # применяется в мониторе ко всем фильтрам — в params фильтра его не храним.
     url = base  # чистый URL марки/модели/сделки без неработающих GET-параметров
 
     combined_kw = data.get("keyword") or None
 
     summary: dict = {}
+    # Саммари сохраняется в БД и показывается в /list — локализуем предлоги/единицы.
+    _from = "no"   if lang == "lv" else "от"
+    _to   = "līdz" if lang == "lv" else "до"
+    _km   = " km"  if lang == "lv" else " км"
     def rng(a,b,u=""):
         if a and b: return f"{a}–{b}{u}"
-        if a: return f"от {a}{u}"
-        if b: return f"до {b}{u}"
+        if a: return f"{_from} {a}{u}"
+        if b: return f"{_to} {b}{u}"
         return None
     for key,kmin,kmax,unit in [
         ("price","price_min","price_max"," €"),
         ("year","year_min","year_max",""),
-        ("mileage","mile_min","mile_max"," км"),
+        ("mileage","mile_min","mile_max",_km),
     ]:
         r = rng(data.get(kmin),data.get(kmax),unit)
         if r: summary[key] = r
@@ -1307,6 +1575,38 @@ async def save_filter(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text(t(lang,"saving"))
     await cb.bot.send_chat_action(cb.from_user.id, "typing")
 
+    # ── Проверяем целевой URL и определяем самую свежую выдачу ────────────────
+    # Голый раздел-ХАБ (меню подразделов) мониторить бессмысленно. Раздел с
+    # выдачей через период (вакансии и т.п.) мониторим через его свежую выдачу.
+    # Фильтр периода (сегодня/2дн/5дн) есть в КАЖДОМ разделе ss.lv.
+    probe_ads = None
+    try:
+        probe_ads = await asyncio.wait_for(p.fetch_listings(url), timeout=15.0)
+    except Exception as e:
+        log.warning(f"save probe: {e}")
+    period_key, period_url = None, None
+    try:
+        period_key, _pn, period_url = await asyncio.wait_for(p.get_recent(url), timeout=15.0)
+    except Exception as e:
+        log.warning(f"get_recent: {e}")
+    if probe_ads is not None and len(probe_ads) == 0:
+        if period_url:                         # раздел-агрегатор → мониторим выдачу
+            url = period_url
+            try:    probe_ads = await asyncio.wait_for(p.fetch_listings(url), timeout=15.0)
+            except Exception: probe_ads = []
+        elif not combined_kw:                  # ни листинга, ни периодов
+            kids = []
+            try: kids = await asyncio.wait_for(p.get_subcategories(sub_path, lang), timeout=10.0)
+            except Exception: pass
+            if kids:                           # это меню-хаб → просим углубиться
+                kbw = InlineKeyboardBuilder()
+                kbw.button(text=t(lang,"open_sslv"), url=url)
+                kbw.button(text=t(lang,"back"),      callback_data="back_to_filters")
+                await cb.message.edit_text(t(lang,"save_hub_warning"),
+                                           reply_markup=kbw.as_markup(), disable_web_page_preview=True)
+                await cb.answer(); return
+            # иначе тихий лист (0 объявлений сейчас, но подразделов нет) — сохраняем
+
     fid = await db.add_filter(
         user_id=cb.from_user.id, category=data.get("cat_id","other"),
         category_path=sub_path, brand=brand, brand_slug=bslug,
@@ -1316,15 +1616,30 @@ async def save_filter(cb: CallbackQuery, state: FSMContext):
         check_interval=data.get("check_interval", cat_mod.DEFAULT_INTERVAL),
     )
 
+    # Снимок текущей выдачи → помечаем «виденным» (переиспользуем probe_ads).
     seen_n = 0
     try:
-        ads = await asyncio.wait_for(p.fetch_listings(url), timeout=15.0)
-        ads = p.apply_keyword(ads, combined_kw)
-        ads = p.apply_filters(ads, params)
+        ads = p.apply_filters(p.apply_keyword(list(probe_ads or []), combined_kw), params)
         await db.mark_seen(fid, [a["id"] for a in ads])
         seen_n = len(ads)
     except Exception as e:
         log.warning(f"snapshot: {e}")
+
+    # Счёт раздела за период — БЫСТРО, без открытия карточек (иначе каждое
+    # сохранение тормозит на десятках сетевых запросов). Точную фильтрацию по
+    # «Моё место» применяем при ПОКАЗЕ (кнопка) и в УВЕДОМЛЕНИЯХ — там монитор и
+    # так открывает карточку каждого нового объявления, гео там бесплатно.
+    fresh_n = 0
+    geo_active = False
+    if period_url:
+        try:
+            tads = await asyncio.wait_for(p.fetch_listings(period_url), timeout=15.0)
+            tads = p.apply_filters(p.apply_keyword(tads, combined_kw), params)
+            fresh_n = len(tads)
+            geo_user = await db.get_user(cb.from_user.id)
+            geo_active = bool(geo_user and geo_user.get("geo_mode"))
+        except Exception as e:
+            log.warning(f"recent count: {e}")
 
     specs_block = ""
     if brand and model and sub_path in cat_mod.TRANSPORT_FULL:
@@ -1335,27 +1650,181 @@ async def save_filter(cb: CallbackQuery, state: FSMContext):
     sub_l = data.get("sub_label","")
     iv    = data.get("check_interval", cat_mod.DEFAULT_INTERVAL)
 
+    today_str = datetime.now().strftime("%d.%m.%Y")
+    period_phrase = t(lang, {"today-2": "period_2", "today-5": "period_5"}.get(period_key, "period_today"))
     text = (
-        t(lang,"saved",fid=fid,n=seen_n,url=url)
-        + f"\n\n{cat_l}" + (f" › {sub_l}" if sub_l else "")
-        + (f"\n<b>{brand}</b>" if brand else "")
-        + (f" {model}" if model else "")
-        + f"\n{_filter_summary(data)}"
-        + f"\n⏱ {_interval_label(iv)}"
+        t(lang,"saved",fid=fid,period=period_phrase,n=fresh_n,date=today_str,url=url)
+        + (f"\n{t(lang,'geo_note')}" if geo_active else "")   # гео применится при показе/уведомлениях
+        + f"\n\n{_esc(cat_l)}" + (f" › {_esc(sub_l)}" if sub_l else "")
+        + (f"\n<b>{_esc(brand)}</b>" if brand else "")
+        + (f" {_esc(model)}" if model else "")
+        + f"\n{_filter_summary(data, lang)}"
+        + f"\n⏱ {_interval_label(iv, lang)}"
         + specs_block
     )
-    await cb.message.edit_text(text, parse_mode="HTML", disable_web_page_preview=True)
+
+    # Если есть свежие объявления — предлагаем показать (иначе юзер их пропустит:
+    # они помечены «виденными» и в уведомления не пойдут).
+    kb = None
+    if fresh_n > 0 and period_url:
+        kb = InlineKeyboardBuilder()
+        kb.button(text=t(lang,"yes"), callback_data=f"showtoday:{fid}")
+        kb.button(text=t(lang,"no"),  callback_data="hidetoday")
+        text += f"\n\n{t(lang,'show_today_q')}"
+
+    markup = kb.as_markup() if kb else None
+    try:
+        await cb.message.edit_text(text, parse_mode="HTML", disable_web_page_preview=True,
+                                   reply_markup=markup)
+    except Exception:   # сообщение могло устареть/не отредактироваться — шлём новым
+        try:
+            await cb.message.answer(text, parse_mode="HTML", disable_web_page_preview=True,
+                                    reply_markup=markup)
+        except Exception as e:
+            log.warning(f"save final msg: {e}")
     await state.clear()
     await cb.answer()
+
+
+@router.callback_query(F.data == "hidetoday")
+async def on_hide_today(cb: CallbackQuery):
+    # Убираем кнопки, оставляем текст карточки сохранения как есть.
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("showtoday:"))
+async def on_show_today(cb: CallbackQuery):
+    await cb.answer()
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    fid  = int(cb.data.split(":", 1)[1])
+    lang = await _lang(cb.from_user.id)
+    uid  = cb.from_user.id
+    f    = await db.get_filter(fid, uid)
+    if not f:
+        log.warning("show_today: filter #%s not found for user %s", fid, uid)
+        await cb.bot.send_message(uid, t(lang, "today_empty"))
+        return
+
+    await cb.bot.send_chat_action(uid, "typing")
+
+    # Самая свежая выдача (сегодня → 2 дня → 5 дней) + клиентские фильтры.
+    # Несколько попыток: ss.lv иногда отдаёт пустую/сбойную страницу, хотя при
+    # сохранении объявления были — не хотим из-за этого писать «нет».
+    ads, err, period_url = [], False, None
+    for attempt in range(3):
+        try:
+            _pk, _pn, period_url = await asyncio.wait_for(p.get_recent(f["url"]), timeout=20.0)
+            log.info("show_today #%s try%d: period_url=%s", fid, attempt, period_url)
+            if period_url:
+                ads = await asyncio.wait_for(p.fetch_listings(period_url), timeout=20.0)
+                ads = p.apply_keyword(ads, f.get("keyword"))
+                ads = p.apply_filters(ads, f.get("params"))
+            err = False
+        except Exception as e:
+            err = True
+            log.warning("show_today fetch #%s try%d: %s", fid, attempt, e)
+        if ads or not err:
+            break
+        await asyncio.sleep(1.0)
+
+    log.info("show_today #%s: %d объявлений к показу (err=%s)", fid, len(ads), err)
+    if not ads:
+        # Прямая ссылка на свежую выдачу ss.lv как запасной вариант.
+        link = period_url or f["url"]
+        kbl = InlineKeyboardBuilder()
+        kbl.button(text=t(lang, "open_sslv"), url=link)
+        await cb.bot.send_message(uid, t(lang, "today_retry" if err else "today_empty"),
+                                  reply_markup=kbl.as_markup())
+        return
+
+    # Эти объявления считаем «виденными» — повторно в уведомления не уйдут.
+    await db.mark_seen(fid, [a["id"] for a in ads])
+    geo_user = await db.get_user(uid)            # общее гео «Моё место»
+    geo_active = bool(geo_user and geo_user.get("geo_mode"))
+
+    # Отбор показа. С активным гео надо открыть карточки и отфильтровать —
+    # делаем ПАРАЛЛЕЛЬНО (карточки кэшируются, многие уже открыты счётчиком).
+    # Без гео карточки для фильтра не нужны → показываем первые как есть (быстро).
+    if geo_active:
+        scan = ads[:30]                          # ограничиваем скан — показ остаётся шустрым
+        sem = asyncio.Semaphore(8)
+        async def _hydrate(ad):
+            async with sem:
+                try:
+                    det = await asyncio.wait_for(p.fetch_ad_details(ad["url"]), timeout=8.0)
+                    if det.get("archived"):
+                        ad["_skip"] = True; return
+                    if det.get("city"):     ad["city"]     = det["city"]
+                    if det.get("date_fmt"): ad["date_fmt"] = det["date_fmt"]
+                    ad["opts"] = det.get("opts", {})
+                except Exception:
+                    pass
+        await asyncio.gather(*(_hydrate(a) for a in scan))
+        picked = []
+        for ad in scan:
+            if ad.get("_skip"):
+                continue
+            try:
+                if await monitor.geo_ok(ad, geo_user):
+                    picked.append(ad)
+            except Exception:
+                picked.append(ad)
+    else:
+        picked = ads
+
+    matched = len(picked)
+    sent = 0
+    for ad in picked[:15]:
+        if not geo_active:                       # детали для показа (город/дата); кэш дешёвый
+            try:
+                det = await asyncio.wait_for(p.fetch_ad_details(ad["url"]), timeout=8.0)
+                if det.get("city"):     ad["city"]     = det["city"]
+                if det.get("date_fmt"): ad["date_fmt"] = det["date_fmt"]
+                ad["opts"] = det.get("opts", {})
+            except Exception:
+                pass
+        try:
+            txt = await monitor._build_msg(f, ad, lang)
+        except Exception as e:
+            log.warning("show_today build #%s: %s", fid, e)
+            txt = (f"🆕 {_esc(ad.get('title',''))}\n{_esc(ad.get('details',''))}\n"
+                   f"{_esc(ad.get('price',''))}\n{_esc(ad.get('url',''))}")
+        try:
+            if ad.get("photo"):
+                try:
+                    await cb.bot.send_photo(uid, ad["photo"], caption=txt, parse_mode="HTML")
+                except Exception:        # битый URL фото у ss.lv → шлём текстом
+                    await cb.bot.send_message(uid, txt, parse_mode="HTML",
+                                              disable_web_page_preview=False)
+            else:
+                await cb.bot.send_message(uid, txt, parse_mode="HTML",
+                                          disable_web_page_preview=False)
+            sent += 1
+            await asyncio.sleep(0.2)
+        except Exception as e:
+            log.warning("show_today send #%s: %s", fid, e)
+    if matched > sent:                           # показали не все подходящие — подсказка
+        try: await cb.bot.send_message(uid, t(lang, "more_listings", n=matched - sent))
+        except Exception: pass
+    await cb.bot.send_message(uid, t(lang, "today_done") if sent else t(lang, "today_empty"))
 
 
 # ─────────────────────────────────────────────
 # /list
 # ─────────────────────────────────────────────
 @router.message(Command("list"))
-async def cmd_list(msg: Message):
-    lang    = await _lang(msg.from_user.id)
-    filters = await db.list_filters(msg.from_user.id)
+async def cmd_list(msg: Message, uid: int | None = None):
+    uid     = uid or msg.from_user.id
+    lang    = await _lang(uid)
+    filters = await db.list_filters(uid)
     if not filters:
         await msg.answer(t(lang,"no_filters"))
         return
@@ -1364,13 +1833,13 @@ async def cmd_list(msg: Message):
         brand = f.get("brand") or ""
         model = f.get("model") or ""
         cat   = i18n.cat_label(f.get("category",""), lang)
-        iv    = _interval_label(f.get("check_interval") or 300)
+        iv    = _interval_label(f.get("check_interval") or 300, lang)
         sent  = f.get("total_sent") or 0
-        lines = [f"<b>#{f['id']}</b> {cat}"]
-        if brand: lines.append(f"  🚗 {brand}{f' {model}' if model else ''}")
+        lines = [f"<b>#{f['id']}</b> {_esc(cat)}"]
+        if brand: lines.append(f"  🚗 {_esc(brand)}{f' {_esc(model)}' if model else ''}")
         for k,icon in [("price","💶"),("year","📅"),("mileage","🛣"),
                        ("gearbox","⚙️"),("bodytype","🚙"),("keyword","🔎")]:
-            if s.get(k): lines.append(f"  {icon} {s[k]}")
+            if s.get(k): lines.append(f"  {icon} {_esc(str(s[k]))}")
         lines.append(f"  ⏱ {iv}  |  📨 {sent}")
         kb = InlineKeyboardBuilder()
         kb.button(text=t(lang,"open_sslv"), url=f["url"])
@@ -1387,6 +1856,102 @@ async def del_filter(cb: CallbackQuery):
     await db.delete_filter(fid, cb.from_user.id)
     await cb.message.edit_text(t(lang,"filter_deleted",fid=fid))
     await cb.answer()
+
+
+# ─────────────────────────────────────────────
+# /diag — самодиагностика прямо в Telegram + безопасное само-лечение
+# ─────────────────────────────────────────────
+# Эталонные «живые» точки: транспорт-лист, вакансии-агрегатор, недвижимость-лист.
+_DIAG_TARGETS = [
+    ("🚗", "https://www.ss.lv/ru/transport/cars/audi/sell/"),
+    ("💼", "https://www.ss.lv/ru/work/are-required/today/"),
+    ("🏠", "https://www.ss.lv/ru/real-estate/flats/jurmala/"),
+]
+
+
+@router.message(Command("diag"))
+async def cmd_diag(msg: Message, uid: int | None = None):
+    # uid передаётся, когда вызвано из inline-кнопки (msg.from_user там — бот).
+    uid  = uid or msg.from_user.id
+    lang = await _lang(uid)
+    m    = await msg.answer(t(lang, "diag_running"))
+    lines = [t(lang, "diag_title"), ""]
+
+    async def _check(icon, url):
+        try:
+            ads = await asyncio.wait_for(p.fetch_listings(url), timeout=15.0)
+            n, turl = await asyncio.wait_for(p.get_today(url), timeout=15.0)
+            ok = "✅" if ads else "⚠️"
+            return t(lang, "diag_line", ok=ok, icon=icon, ads=len(ads),
+                     today=n, chk=" /today✓" if turl else "")
+        except Exception as e:
+            return f"❌ {icon} {type(e).__name__}"
+
+    try:
+        res = await asyncio.gather(*[_check(i, u) for i, u in _DIAG_TARGETS])
+        lines += list(res)
+    except Exception as e:
+        log.warning("diag checks: %s", e)
+    lines.append("")
+
+    # Тест доставки сообщений: отправить и сразу удалить.
+    try:
+        ping = await msg.bot.send_message(uid, "·")
+        try: await msg.bot.delete_message(uid, ping.message_id)
+        except Exception: pass
+        lines.append(t(lang, "diag_send_ok"))
+    except Exception:
+        lines.append(t(lang, "diag_send_fail"))
+
+    # Фильтры пользователя + детект «застрявших» (0 объявлений, не по слову).
+    try:
+        filters = await db.list_filters(uid)
+        lines.append(t(lang, "diag_filters", n=len(filters)))
+        stuck = []
+        for f in filters[:10]:
+            if f.get("keyword"):
+                continue
+            try:
+                a = await asyncio.wait_for(p.fetch_listings(f["url"]), timeout=10.0)
+                if not a:
+                    stuck.append(f["id"])
+            except Exception:
+                pass
+        if stuck:
+            lines.append(t(lang, "diag_stuck", ids=", ".join("#" + str(x) for x in stuck)))
+    except Exception as e:
+        log.warning("diag db: %s", e)
+
+    lines.append("💾 " + cache.stats())
+    kb = InlineKeyboardBuilder()
+    kb.button(text=t(lang, "diag_fix_btn"), callback_data="diagfix")
+    await _edit(m, "\n".join(lines), reply_markup=kb.as_markup(), parse_mode="HTML")
+
+
+@router.callback_query(F.data == "diagfix")
+async def on_diag_fix(cb: CallbackQuery, state: FSMContext):
+    # Безопасное само-лечение (код НЕ правим — это делает деплой):
+    #  1) сброс кэшей ss.lv;  2) форс-перепроверка фильтров;  3) снятие
+    #  «зависшего» состояния мастера добавления (главная причина «бот виснет»);
+    #  4) переустановка меню «/» и кнопок — если они слетели.
+    lang = await _lang(cb.from_user.id)
+    await cb.answer()
+    total = 0
+    try:    total += sum(p.clear_caches().values())
+    except Exception as e: log.warning("diagfix parser caches: %s", e)
+    try:    total += cache.clear()
+    except Exception as e: log.warning("diagfix cache: %s", e)
+    try:    await db.reset_user_checks(cb.from_user.id)
+    except Exception as e: log.warning("diagfix reset checks: %s", e)
+    try:    await state.clear()          # снять зависший мастер добавления
+    except Exception as e: log.warning("diagfix state: %s", e)
+    try:                                  # убрать дублирующее меню команд «/»
+        await cb.bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=cb.from_user.id))
+    except Exception as e: log.warning("diagfix cmds: %s", e)
+    await cb.message.answer(t(lang, "diag_fixed", n=total))
+    try:                                  # вернуть постоянные кнопки внизу
+        await cb.bot.send_message(cb.from_user.id, "⬇️", reply_markup=main_kb(lang))
+    except Exception as e: log.warning("diagfix kb: %s", e)
 
 
 # ─────────────────────────────────────────────
@@ -1410,7 +1975,8 @@ async def noop(cb: CallbackQuery):
 # Регистрируется ПОСЛЕДНИМ: ловит устаревшие кнопки (после смены состояния/
 # нового /add), чтобы у пользователя не висели «часики».
 @router.callback_query()
-async def on_stale_callback(cb: CallbackQuery):
+async def on_stale_callback(cb: CallbackQuery, state: FSMContext):
+    log.warning("STALE callback: data=%r state=%s", cb.data, await state.get_state())
     try:
         await cb.answer("⏳ Кнопка устарела — открой меню заново: /add", show_alert=False)
     except Exception:

@@ -55,16 +55,20 @@ async def init(path: str):
     DB_PATH = path
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(INIT_SQL)
-        for col, defval in [
-            ("check_interval",  "INTEGER DEFAULT 300"),
-            ("last_checked_at", "REAL DEFAULT 0"),
-            ("category_path",   "TEXT"),
-            ("total_sent",      "INTEGER DEFAULT 0"),
-            ("last_sent_at",    "TEXT"),
-            ("lang",            "TEXT DEFAULT 'ru'"),
+        for col, defval, table in [
+            ("check_interval",  "INTEGER DEFAULT 300", "filters"),
+            ("last_checked_at", "REAL DEFAULT 0",      "filters"),
+            ("category_path",   "TEXT",                "filters"),
+            ("total_sent",      "INTEGER DEFAULT 0",   "filters"),
+            ("last_sent_at",    "TEXT",                "filters"),
+            ("lang",            "TEXT DEFAULT 'ru'",   "users"),
+            # Гео-настройка пользователя («Моё место»): режим + район + радиус.
+            ("geo_mode",        "TEXT",                "users"),   # 'gps' | 'area' | NULL
+            ("geo_region",      "TEXT",                "users"),   # напр. «Рига»
+            ("geo_district",    "TEXT",                "users"),   # напр. «Плявниеки»
+            ("geo_radius",      "INTEGER",             "users"),   # км (для gps), NULL=без огр.
         ]:
             try:
-                table = "filters" if col != "lang" else "users"
                 await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {defval}")
             except Exception:
                 pass
@@ -104,6 +108,26 @@ async def set_user_location(user_id: int, lat: float, lon: float, name: str):
                lat=excluded.lat, lon=excluded.lon,
                location_name=excluded.location_name""",
             (user_id, lat, lon, name),
+        )
+        await db.commit()
+
+
+async def set_user_geo(user_id: int, mode: Optional[str], lat, lon, name: str,
+                       region: Optional[str] = None, district: Optional[str] = None,
+                       radius: Optional[int] = None):
+    """Сохранить гео-настройку «Моё место»: режим (gps/area), точку отсчёта
+    (lat/lon + имя для показа) и критерий фильтра (район или радиус)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO users (user_id, lat, lon, location_name,
+                                  geo_mode, geo_region, geo_district, geo_radius)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                  lat=excluded.lat, lon=excluded.lon,
+                  location_name=excluded.location_name,
+                  geo_mode=excluded.geo_mode, geo_region=excluded.geo_region,
+                  geo_district=excluded.geo_district, geo_radius=excluded.geo_radius""",
+            (user_id, lat, lon, name, mode, region, district, radius),
         )
         await db.commit()
 
@@ -176,6 +200,19 @@ async def list_filters(user_id: int) -> list[dict]:
             return [_row(r) for r in await cur.fetchall()]
 
 
+async def get_filter(filter_id: int, user_id: int | None = None) -> dict | None:
+    sql = "SELECT * FROM filters WHERE id=?"
+    args: tuple = (filter_id,)
+    if user_id is not None:
+        sql += " AND user_id=?"
+        args = (filter_id, user_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(sql, args) as cur:
+            r = await cur.fetchone()
+            return _row(r) if r else None
+
+
 async def delete_filter(filter_id: int, user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -199,6 +236,18 @@ async def update_last_checked(filter_id: int):
             (time.time(), filter_id),
         )
         await db.commit()
+
+
+async def reset_user_checks(user_id: int) -> int:
+    """Сбросить last_checked_at у всех фильтров пользователя → монитор
+    перепроверит их в ближайшем цикле (для /diag «авто-починка»)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "UPDATE filters SET last_checked_at=0 WHERE user_id=? AND active=1",
+            (user_id,),
+        )
+        await db.commit()
+        return cur.rowcount or 0
 
 
 async def increment_sent(filter_id: int, count: int = 1):

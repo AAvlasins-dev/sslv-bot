@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import re
+import time
 from typing import Optional
 
 import aiohttp
@@ -197,9 +198,45 @@ CITIES: dict[str, tuple[float, float]] = {
     "pieria": (56.9460, 24.1059),
 }
 
+# Русское название города → латышское (латиница). Для en/lv показываем
+# латышский вариант, для ru — как есть. Выведено из таблицы координат.
+CITY_RU2LV: dict[str, str] = {
+    "адажи": "Ādaži", "айзкраукле": "Aizkraukle", "айзпуте": "Aizpute",
+    "акнисте": "Aknīste", "алуксне": "Alūksne", "балви": "Balvi",
+    "бауска": "Bauska", "броцены": "Brocēni", "валмиера": "Valmiera",
+    "варакляны": "Varakļāni", "вентспилс": "Ventspils", "вецумниеки": "Vecumnieki",
+    "виляка": "Viļaka", "виляны": "Viļāni", "гробиня": "Grobiņa",
+    "гулбене": "Gulbene", "дагда": "Dagda", "даугавпилс": "Daugavpils",
+    "добеле": "Dobele", "екабпилс": "Jēkabpils", "елгава": "Jelgava",
+    "зилупе": "Zilupe", "иецава": "Iecava", "икшкиле": "Ikšķile",
+    "инчукалнс": "Inčukalns", "кандава": "Kandava", "карникава": "Carnikava",
+    "карсава": "Kārsava", "кекава": "Ķekava", "кокнесе": "Koknese",
+    "краслава": "Krāslava", "кулдига": "Kuldīga", "лиелварде": "Lielvārde",
+    "лиепая": "Liepāja", "лимбажи": "Limbaži", "лудза": "Ludza",
+    "мадона": "Madona", "марупе": "Mārupe", "нерета": "Nereta",
+    "ница": "Nīca", "огре": "Ogre", "павилоста": "Pāvilosta",
+    "плявиняс": "Pļaviņas", "прейли": "Preiļi", "резекне": "Rēzekne",
+    "рига": "Rīga", "рижский": "Rīga", "рижский район": "Rīga",
+    "руйиена": "Rūjiena", "саласпилс": "Salaspils", "салдус": "Saldus",
+    "саулкрасти": "Saulkrasti", "сигулда": "Sigulda", "скривери": "Skrīveri",
+    "скрунда": "Skrunda", "смилтене": "Smiltene", "стренчи": "Strenči",
+    "субате": "Subate", "талси": "Talsi", "тервете": "Tērvete",
+    "тукумс": "Tukums", "цесвайне": "Cesvaine", "цесис": "Cēsis",
+    "энгуре": "Engure", "юрмала": "Jūrmala", "яунелгава": "Jaunjelgava",
+}
+
+
+def localize_city(name: str, lang: str) -> str:
+    """«Лимбажи» → «Limbaži» для en/lv; для ru возвращает как есть."""
+    if not name or lang == "ru":
+        return name
+    return CITY_RU2LV.get(name.lower().strip(), name)
+
+
 # Nominatim cache: city_name -> (lat, lon, canonical) | None
 _nominatim_cache: dict[str, Optional[tuple]] = {}
 _nominatim_lock = asyncio.Lock()
+_nominatim_last = 0.0          # время последнего СЕТЕВОГО запроса (для ToS 1 req/sec)
 
 
 def _normalize(name: str) -> str:
@@ -227,7 +264,12 @@ async def geocode_nominatim(name: str) -> Optional[tuple[float, float, str]]:
     key = _normalize(name)
     async with _nominatim_lock:
         if key in _nominatim_cache:
-            return _nominatim_cache[key]
+            return _nominatim_cache[key]            # кэш-хит — мгновенно, без паузы
+        # ToS Nominatim: не чаще 1 запроса/сек. Пауза только перед СЕТЕВЫМ вызовом.
+        global _nominatim_last
+        wait = 1.1 - (time.monotonic() - _nominatim_last)
+        if wait > 0:
+            await asyncio.sleep(wait)
         try:
             url = "https://nominatim.openstreetmap.org/search"
             params = {"q": f"{name}, Latvia", "format": "json", "limit": 1}
@@ -245,9 +287,11 @@ async def geocode_nominatim(name: str) -> Optional[tuple[float, float, str]]:
                                 item.get("display_name", name),
                             )
                             _nominatim_cache[key] = result
+                            _nominatim_last = time.monotonic()
                             return result
         except Exception as e:
             log.warning(f"Nominatim failed for '{name}': {e}")
+        _nominatim_last = time.monotonic()
         _nominatim_cache[key] = None
         return None
 

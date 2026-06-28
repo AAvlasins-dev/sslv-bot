@@ -3,12 +3,13 @@ import asyncio
 import logging
 
 from aiogram import Bot, Dispatcher
-from aiogram.types import BotCommand, BotCommandScopeDefault, MenuButtonCommands
+from aiogram.types import BotCommandScopeDefault, MenuButtonDefault, ErrorEvent
 
 import cache
 import config
 import db
 import bot as botmod
+import i18n
 import monitor
 import parser as p
 
@@ -17,16 +18,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("main")
-
-BOT_COMMANDS = [
-    BotCommand(command="start",    description="🚀 Запустить бота / Start"),
-    BotCommand(command="add",      description="➕ Добавить фильтр"),
-    BotCommand(command="list",     description="📋 Мои фильтры"),
-    BotCommand(command="stats",    description="📊 Статистика"),
-    BotCommand(command="location", description="📍 Моё местоположение"),
-    BotCommand(command="lang",     description="🌐 Выбрать язык"),
-    BotCommand(command="cancel",   description="❌ Отмена"),
-]
 
 
 async def main():
@@ -37,10 +28,38 @@ async def main():
     dp  = Dispatcher()
     dp.include_router(botmod.router)
 
-    # Команды и кнопка меню
-    await bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeDefault())
-    await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
-    log.info("Bot commands set (%d)", len(BOT_COMMANDS))
+    # Глобальная страховка: любое необработанное исключение в хендлере не должно
+    # оставлять пользователя с «висящими часиками» — даём явный ответ.
+    @dp.errors()
+    async def _on_error(event: ErrorEvent):
+        log.exception("unhandled handler error: %s", event.exception)
+        upd = event.update
+        try:
+            if getattr(upd, "callback_query", None):
+                await upd.callback_query.answer(
+                    "⚠️ Ошибка. Откройте меню заново: /add", show_alert=True)
+            elif getattr(upd, "message", None):
+                await upd.message.answer("⚠️ Что-то пошло не так. Откройте меню заново: /add")
+        except Exception:
+            pass
+        return True   # помечаем обработанным — диспетчер не падает
+
+    # Меню команд «/» НЕ используем — у бота есть постоянные кнопки внизу (main_kb),
+    # чтобы не было дублирующегося меню. Чистим ранее установленные команды и
+    # возвращаем кнопке меню поведение по умолчанию (без списка команд).
+    for lc in (None, "ru", "lv", "en"):
+        try:
+            if lc is None:
+                await bot.delete_my_commands(scope=BotCommandScopeDefault())
+            else:
+                await bot.delete_my_commands(scope=BotCommandScopeDefault(), language_code=lc)
+        except Exception as e:
+            log.warning("delete_my_commands %s: %s", lc, e)
+    try:
+        await bot.set_chat_menu_button(menu_button=MenuButtonDefault())
+    except Exception as e:
+        log.warning("set_chat_menu_button: %s", e)
+    log.info("Bot command menu removed (using reply keyboard only)")
 
     # Монитор
     asyncio.create_task(monitor.monitor_loop(

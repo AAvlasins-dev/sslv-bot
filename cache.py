@@ -31,26 +31,33 @@ def stats() -> str:
     return f"{len(_CACHE)} записей в кэше"
 
 
+def clear() -> int:
+    """Полный сброс кэша (для /diag «авто-починка»). Возвращает число записей."""
+    n = len(_CACHE)
+    _CACHE.clear()
+    return n
+
+
 # ─── Кэшированные получатели ──────────────────────────────────
 
-async def subcats(path: str, p_module) -> list:
-    key = f"sub:{path}"
+async def subcats(path: str, p_module, lang: str = "ru") -> list:
+    key = f"sub:{lang}:{path}"
     cached = get(key)
     if cached is not None:
         return cached
-    result = await p_module.get_subcategories(path)
+    result = await p_module.get_subcategories(path, lang)
     put(key, result)
     return result
 
 
-async def models(brand_slug: str, cat: str, p_module) -> list:
-    key = f"mod:{brand_slug}:{cat}"
+async def models(brand_slug: str, cat: str, p_module, lang: str = "ru") -> list:
+    key = f"mod:{lang}:{brand_slug}:{cat}"
     cached = get(key)
     if cached is not None:
         return cached
     try:
         result = await asyncio.wait_for(
-            p_module.get_models(brand_slug, cat), timeout=8.0
+            p_module.get_models(brand_slug, cat, lang), timeout=8.0
         )
     except Exception:
         result = []
@@ -96,19 +103,19 @@ async def preload(p_module):
 
     tasks = []
 
-    # 1. Подкатегории всех топ-категорий
+    # 1. Подкатегории всех топ-категорий (русский — язык по умолчанию)
     for cat in cat_mod.TOP_CATEGORIES:
-        key  = f"sub:{cat['path']}"
+        key  = f"sub:ru:{cat['path']}"
         tasks.append(_safe(_load_subcats(cat["path"], p_module, key)))
 
-    # 2. Модели топ авто-марок
+    # 2. Модели топ авто-марок (русский — язык по умолчанию)
     for slug in PRELOAD_CAR_BRANDS:
-        key = f"mod:{slug}:cars"
+        key = f"mod:ru:{slug}:cars"
         tasks.append(_safe(_load_models(slug, "cars", p_module, key)))
 
     # 3. Модели топ мото-марок
     for slug in PRELOAD_MOTO_BRANDS:
-        key = f"mod:{slug}:motorcycles"
+        key = f"mod:ru:{slug}:motorcycles"
         tasks.append(_safe(_load_models(slug, "motorcycles", p_module, key)))
 
     await asyncio.gather(*tasks)
